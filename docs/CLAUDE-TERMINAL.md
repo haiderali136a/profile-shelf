@@ -1,0 +1,145 @@
+# Claude and Terminal
+
+Coding terminals are discovered automatically, even before any terminal profile has been saved. The strip has a collapsible **Terminals** section with a refresh button. **Profiles → Terminal connector** controls automatic discovery and expansion. Only detected entries disappear when their sessions close; manually saved projects remain available in settings.
+
+Add Claude Desktop, a Claude Code project, or an Apple Terminal tab from **Profiles → Add Profile → App**. These entries share the strip, colors, custom artwork, keyboard shortcuts, Finder shortcuts and ordering with Codex profiles.
+
+Only open Terminal tabs with a foreground coding-agent process appear in the strip or terminal suggestions. Claude Code and Codex are recognized, and so is every terminal tool in [AGENT-COVERAGE.md](AGENT-COVERAGE.md). Idle shells, stopped/background processes and closed tabs are excluded. A small circular agent logo on the upper-right corner of the Terminal icon identifies the active tool, including when it changes in the same tab. Detection reads process executable names, TTYs and foreground state. Tools that run under `node` or `python` are identified from that process's argv, which names the installed script; a shared command name such as `pi` or `agent` counts only when its install path names the tool. Detection never reads a process environment or terminal contents. The picker refreshes while open and revalidates a selection before saving it.
+
+Saved profiles for Grok Bot, Grok Build, Hermes, Gemini CLI, and OpenCode use either the sign-in already on this Mac or a separate account in their own Profile Shelf folder. A terminal tool opens in a new Terminal tab in the profile's project folder; if its command is not in a usual install location, the Terminal login shell finds it on your own `PATH`. Other recognized tools open with the existing sign-in and say that separate accounts aren't supported. Profile Shelf does not store API keys or tokens for any of them. Claude and Codex keep the launch and storage behavior described below.
+
+Saved projects remain in Profiles settings so they can be reopened. Hidden terminals do not consume strip space or keyboard shortcuts. Order is stored independently of visibility. Codex terminal support covers detection, branding and window control; per-tab Codex CLI activity/usage is unavailable rather than borrowed from an unrelated desktop account.
+
+Drag the dotted handle on a tile or profile row to reorder it. A floating card follows the pointer, the original fades, and an insertion line indicates before/after the highlighted destination. Escape cancels. Reduced Motion disables movement animations. The new order is saved when you drop; cancelling or dropping outside keeps the old order. Hover over the page arrows while dragging to reach another page. Move earlier/later actions remain available through the tile menu and accessibility actions.
+
+## Other terminal apps
+
+Coding sessions in other terminals appear in the **Terminals** section too, found by their TTY: iTerm2, Ghostty, Warp, Alacritty, kitty, WezTerm, the terminals inside VS Code, Cursor, Zed and Claude, and panes inside tmux or screen. Profile Shelf reads the same process facts as for Terminal.app plus each process's parent, and walks up from the session to the app that owns it. Each tile shows that app's icon with the agent's badge and **Running in** the app's name.
+
+- **iTerm2:** clicking the tile selects that exact session through iTerm2's scripting. macOS asks once for permission to control iTerm2; without it the app comes forward and a notice links to Privacy settings.
+- **Other apps:** Ghostty, Warp and editor terminals have no scripting for tabs, so Profile Shelf brings the app forward as it was.
+- **tmux and screen:** a pane cannot be selected from outside, so the tile says which TTY it is on.
+- **Opening and closing:** new sessions always open in Terminal.app, and Profile Shelf closes only Terminal.app windows. Other apps keep control of their own sessions.
+- **Terminal.app without Automation:** its coding sessions are still found this way and can be brought forward, though not selected or closed by tab.
+
+SSH sessions to other machines and agents running without a terminal (for example inside Claude Desktop's own Code view) are not included.
+
+## Grid layout
+
+Use the grid icon in the expanded strip to choose Automatic or set your own Columns and Rows. **Settings → Appearance → Grid layout** exposes the same controls with a visual preview. Dimensions mean columns × rows per page, with 1–12 of each. The choice persists across restarts and applies to both the apps and terminal sections, which have independent page controls.
+
+The same grid menu and Appearance settings include independent **Terminals** and **Usage Insights** switches. Turning a section off removes its heading, content and reserved space from the notch; it keeps connection settings, analytics history and saved expansion choices. Hidden terminals do not consume notch shortcuts.
+
+Custom layouts size the panel width from the column count. Tall pages scroll inside the screen; small displays reduce the effective column count so tiles stay readable. Extra profiles are paged, and empty rows are not reserved when fewer profiles are present. Returning to Automatic restores the saved automatic-width settings. Reordering and keyboard shortcuts keep profile identity through layout changes.
+
+## Windows
+
+- Claude Desktop uses the existing installed app and sign-in. Opening it restores its window.
+- A separate Claude account opens its own Claude Desktop instance. See [Separate Claude accounts](#separate-claude-accounts).
+- A Terminal entry points to a specific tab using its window ID, TTY and Terminal process start time. Reused identifiers after a restart cannot select an unrelated tab.
+- Choose an existing tab while adding an entry, or choose a project folder and let Open create a tab. A closed tab reopens as a new tab in the saved folder.
+- A Claude Code project runs `claude` in that folder using your normal shell configuration. Profile Shelf does not supply an API key or change the CLI's account.
+- Close closes a dedicated Terminal window. Terminal retains its normal confirmation for running processes. For a tab in a shared window, Profile Shelf reveals the exact tab and asks you to use Terminal's Close Tab command because Terminal's scripting interface only supports closing entire windows. Other tabs and windows are kept.
+
+macOS asks permission for Profile Shelf to control Terminal. If access is denied, allow it under **System Settings → Privacy & Security → Automation**, then retry the action.
+
+## Activity and subscription usage
+
+Profiles includes separate Codex, Claude Code and Terminal connectors. Codex activity connects automatically to saved profiles and can be disconnected independently. Add Profile lists supported installed Codex and ChatGPT apps directly, with a browse fallback.
+
+Choose **Connect Claude Code** in Profiles. It recognizes the running or installed Claude Desktop app, adds it once, and enables coding-terminal discovery. Existing sessions become visible immediately, but detailed activity requires new sessions with the installed hooks. This adds Profile Shelf-owned command hooks to `~/.claude/settings.json` and installs a local helper. Existing hooks and other settings are preserved, with a private backup before changes. Disconnect removes only Profile Shelf's hooks and restores the previous status line if Profile Shelf still owns it.
+
+Profile Shelf also listens for subagent start and stop events. It stores only the agent IDs and start times, never their prompts or tool calls, and a subagent that never reports a stop stops counting after six hours. While any are running, a session that pauses is not reported as done and keeps showing as working (**Appearance → Activity & sound → Wait for subagents**). A connection made before this existed shows **Update connection** in Profiles; connect again to add the two hooks and the newer helper.
+
+Start a new local Claude Code session after connecting. Hook events report working, waiting, failed and completed states. The strip uses its existing dots, pulses, unread badges, completion cues and optional chimes. Startup snapshots stay quiet. Process identity is checked before an old session can be shown as working. Clicking an entry acknowledges its completed results.
+
+Claude subscription usage comes directly from the signed-in Claude Code account, independently of terminal status-line reports. Profile Shelf refreshes at startup, after wake, every minute while the strip is open, and every five minutes while it is closed. Refresh also requests current data; requests for tiles sharing an account are combined. Rate limits pause retries. Account changes clear previous readings, and network failures retain the last reading with a stale marker.
+
+All Claude tiles using the shared sign-in show the local Claude Code account's shared five-hour and weekly limits. A Claude Desktop tile shows them only when Claude Code is signed in to the same account as that Desktop instance, which Profile Shelf reads from `lastKnownAccountUuid` in the instance's own `config.json`. Otherwise the tile shows **Claude Code uses another account** with **Reconnect**, without a nudge, and never another account's limits. This happens when `claude auth login` completes in a browser that is signed in to claude.ai as someone else. Reconnect pre-fills the Desktop account's email with `--email` when the same configuration's `.claude.json` recorded it for that account. Claude Code project and Terminal tiles run on the Claude Code sign-in itself and always show its limits. A separate Claude account reads its own Claude Code sign-in instead; see [Separate Claude accounts](#separate-claude-accounts). Each account has its own usage client, so requests, rate-limit pauses, nudges and reconnection never mix accounts. Profile Shelf never refreshes or rewrites Claude's credentials itself.
+
+An expired access token is not treated as a sign-in failure while Claude Code still holds a refresh token, because Claude Code renews the token the next time it runs. This is common on days when only the Claude Desktop Code tab is used: that tab passes its own token to sessions and does not renew the Claude Code sign-in. The tile keeps the last verified reading with its stale marker and shows **Waiting for Claude Code to refresh** with **Refresh**; **Reconnect** remains available as a secondary action, without a nudge or sign-in banner. Only the presence of the refresh token is checked. Sign-in is still required, with a nudge, when the credential is missing, has no access token, lacks the `user:profile` scope, has expired without a refresh token, or when Anthropic rejects an unexpired token.
+
+Saved resets are separate from quota reset times. Choose **Connect saved resets** in a Claude tile or **Profiles → Claude usage connector**, then sign in to Claude. Profile Shelf keeps its own WebKit session and checks that it can access the organization verified through Claude Code. The shared sign-in uses Profile Shelf's default web session, so existing connections are kept. Each separate Claude account has its own persistent web session, identified by a stable value derived from its configuration folder, and its organization is verified against that account's Claude Code sign-in. A separate account connects from its own tile and can disconnect from the tile's context menu. It imports no cookies from browsers or Claude Desktop. Available grants, remaining counts and expiry dates are read automatically. Unsupported, signed-out or malformed inventory is unknown, never zero. A saved reset can be banked even if Claude will only allow its use after reaching a limit. Profile Shelf does not consume resets. Disconnect removes its web session and stops this check.
+
+The optional status-line bridge still records local counters for session insights. An existing custom status-line command receives the original input and keeps its output; these reports never replace independently refreshed account usage.
+
+## History and context
+
+Search Chats includes local Claude Code transcripts in `~/.claude/projects`. Project entries are restricted to their saved working directory. The Claude Desktop entry represents the shared local Claude Code history, including terminal sessions. Separate Claude accounts are searched in their own configuration folder instead.
+
+The existing source permissions also apply to Claude history. Enable sources in **Context Access** and connect through the Claude Desktop entry to make retrieval available to Claude Code. This adds the `profile-shelf-context` server to the shared user configuration in `~/.claude.json`, preserving other servers. New Claude Code sessions in Desktop and Terminal can use it. Per-project terminal entries are searchable sources; they do not install competing user-wide MCP identities.
+
+Only visible user and assistant text is returned. Tool payloads, thinking blocks, metadata messages and subagent directories are excluded. Read limits, partial coverage and missing sources are reported explicitly. Ordinary Claude Chat, Cowork, remote and cloud-only conversations are outside this local-history integration.
+
+Usage Insights resumes large Claude transcripts across scans and app restarts, saves only usage metadata and complete-line offsets, and reads appended records without rereading the whole transcript. It continues reading automatically while insights is open and shows an incomplete-token warning until the remaining history is loaded.
+
+Usage Insights reads local Claude Code token counters and estimates their cost at published Standard API rates, with cache reads and writes accounted for separately. Repeated streaming records are counted once. A matching project entry takes precedence over the general Claude entry so the same session is not counted twice. Unknown models and unsupported pricing modes remain unpriced. These estimates are not your Max subscription bill. Rates: [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing), checked 23 September 2026.
+
+## Separate Claude accounts
+
+Choose **Profiles → Add Profile → Claude Desktop → Separate Claude account** to keep another Claude account signed in next to the shared one. Each separate account gets a private folder under `~/Library/Application Support/Profile Shelf/Companions/<profile>` with two parts. If a separate Claude account from an older build is open, Profile Shelf adds it automatically as **Claude** (or choose **Use the separate Claude account that’s open now** instead of **New sign-in**). It uses that existing folder in place, keeps its sign-in and history, never moves it to the Trash, and is not added again after you remove it. **Add running agent apps automatically** turns this off. When you sign in to a new separate account while another Claude window is open, macOS may send the browser's sign-in back to that other window. Quit the other Claude window while you sign in, then open it again; Profile Shelf shows this hint on the account's first launch. Both kinds of folder have the same two parts:
+
+- `electron-user-data`: the Claude Desktop sign-in, chats cache and app settings for that account.
+- `claude-config`: the Claude Code configuration, passed as `CLAUDE_CONFIG_DIR`, so its settings, transcripts and Claude Code sign-in stay apart from `~/.claude`.
+
+Open runs the installed Claude app as a new instance with `open -n --env CLAUDE_CONFIG_DIR=<claude-config> -a Claude --args --user-data-dir=<electron-user-data>`. Sign in with the intended account the first time it opens. Every account can stay open at once. Running instances are matched to tiles by their exact `--user-data-dir` argument, so Show, activity dots and Close act only on that account's window. An instance without the argument, or with Claude's default folder, belongs to the shared sign-in. The shared entry also starts its own instance when another account is already open.
+
+All accounts use the same Claude installation and update together. They share the Claude icon in the macOS Dock; tile colors, letters and artwork stay configurable in the notch and Finder.
+
+Connecting Claude Code installs the same activity hooks in each separate account's `claude-config/settings.json`. The hook helper records the session's `CLAUDE_CONFIG_DIR`, so activity appears only on its own tile. Each configuration keeps its own saved status line. Search Chats reads `claude-config/projects`, and the context connection writes `claude-config/.claude.json` and `claude-config/skills`.
+
+Account usage for a separate account comes from the same Anthropic usage endpoint as the shared sign-in, using that account's own Claude Code credential. Claude Code stores it in the login Keychain as a generic password named `Claude Code-credentials-<hash>`, where `<hash>` is the first eight hexadecimal characters of the SHA-256 of the exact `CLAUDE_CONFIG_DIR` string (NFC-normalized, without resolving trailing slashes or symlinks), under the macOS user name. Profile Shelf derives the name from the same string it passes at launch, reads it through `/usr/bin/security` like the shared item, and falls back to Claude Code's documented `claude-config/.credentials.json` file (64 KB limit). Credentials are never logged or stored by Profile Shelf.
+
+If Claude Code has not signed in for that account yet, the tile shows **Connect usage** instead of a sign-in warning. This includes a Keychain item that holds only MCP server logins, which Claude Code keeps in the same item. Connect, like Reconnect, runs `claude auth login --claudeai` with `CLAUDE_CONFIG_DIR` set to the account's configuration folder, so the credential lands in the account's own Keychain item. While the account endpoint has no reading, the account's Claude Code status-line report is shown as a fallback when one exists; it is labelled as such and never replaces an endpoint reading. Stale-token handling, nudges and saved resets work per account as described in [Activity and subscription usage](#activity-and-subscription-usage). Usage Insights covers the shared configuration only.
+
+Acceptance testing still required: Claude Desktop sign-in through a browser hands control back through a `claude://` link, which macOS may deliver to the instance that registered first. If sign-in completes in the wrong window, quit the other Claude windows during the first sign-in, or use email sign-in. Whether the Desktop Code tab honors `CLAUDE_CONFIG_DIR` from its launch environment is not yet verified.
+
+## Provider differences
+
+Common launch, focus, ordering, profile artwork, activity, search and insights controls use the same Profile Shelf surfaces. Provider-specific capabilities remain explicit:
+
+| Capability | Codex | Claude / Terminal |
+| --- | --- | --- |
+| Separate account containers | Existing profile homes | Shared Claude sign-in or separate Claude Desktop accounts; project/window entries |
+| Live task activity | Local Work/Codex | Connected local Claude Code |
+| Subscription windows | Account endpoint | Claude Code account endpoint, per Claude account |
+| Saved reset credits | When supplied by Codex | Claude web connection, when supplied |
+| App updates | Profile Shelf-managed OpenAI app groups | Claude and macOS manage their own updates |
+| Custom native running Dock copies | Existing experimental option | Not provided; notch and Finder artwork remain configurable |
+| Conversation retrieval | Local Work/Codex | Local Claude Code text |
+
+## Stored data
+
+Claude hook state is saved under `~/Library/Application Support/Profile Shelf/ClaudeSessions` with private permissions. It contains session identifiers, working directory, terminal/process identity, timestamps, state and usage counters. Hook prompts, tool inputs, responses and credentials are discarded. The bridge helper and saved original status-line configuration live in the adjacent `ClaudeBridge` directory. Hook records are not uploaded. Usage requests go directly to Anthropic.
+
+Claude interfaces: [hooks](https://code.claude.com/docs/en/hooks), [status line](https://code.claude.com/docs/en/statusline), [shared Desktop configuration](https://code.claude.com/docs/en/desktop#shared-configuration).
+
+## Preview and verification
+
+Fictional profiles, with no live usage data:
+
+Terminal and coding-agent profiles appear alongside desktop profiles in the strip. Current layout controls are described in the [user guide](GUIDE.md).
+
+Run `swift test`, `./scripts/build-app.sh`, and both packaged smoke scripts. `PROFILE_SHELF_TEST_TERMINAL=1 swift test --filter CompanionIntegrationTests.testLiveTerminalRoundTrip` additionally opens, selects and closes a disposable empty Terminal window, checking that existing tabs remain. `PROFILE_SHELF_RENDER_COMPANIONS=/tmp/profile-shelf-renders swift test --filter CompanionRenderingTests` renders desktop layouts at three widths and three scale settings.
+
+Live Max usage and activity in newly connected Claude sessions still require acceptance testing. The fixture tests establish hook parsing and storage behavior; they do not establish provider-side delivery. Context connection and activity connection are separate opt-in actions.
+# Reconnecting subscription limits
+
+Profile Shelf checks Claude and Codex connections every five minutes in the background
+and every minute while the strip is open. Expired or missing sign-in produces one
+nonactivating nudge per disconnected account, plus a persistent **Sign-in needed**
+label and **Reconnect** action in the tile and menu. Network failures and provider
+rate limits continue using normal retries without a sign-in nudge. An expired Claude
+access token that Claude Code can still renew also gets no nudge; see
+[Activity and subscription usage](#activity-and-subscription-usage).
+
+Reconnect runs the installed provider's official subscription login and opens its
+browser sign-in. Finish with the account belonging to that profile; Profile Shelf then
+refreshes its limits automatically. Codex login uses only the selected profile's
+home and writes the same local credential file used by the usage reader. Claude
+tiles on the shared sign-in share one Claude Code account and one reconnection flow;
+each separate Claude account has its own, scoped to its `CLAUDE_CONFIG_DIR`. Only one Codex login
+can run at a time because its browser callback uses a shared local port. Cancellation
+and a ten-minute timeout stop only the login subprocess. No credential, login URL
+or authorization code is logged. This flow does not connect saved resets, which
+retain their separate web sign-in.

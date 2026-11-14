@@ -1,0 +1,589 @@
+import AppKit
+import SwiftUI
+import DockCore
+
+struct StatusDot: View {
+    let isOpen: Bool
+    var size: CGFloat = 8
+    var body: some View {
+        Circle().fill(isOpen ? Color(red: 0.23, green: 0.9, blue: 0.42) : Color.white.opacity(0.22))
+            .frame(width: size, height: size)
+            .accessibilityLabel(isOpen ? "Open" : "Closed")
+    }
+}
+
+extension ProfileActivityState {
+    var color: Color {
+        switch self {
+        case .working: return Color(red: 0.3, green: 0.65, blue: 1)
+        case .waiting: return .orange
+        case .unread: return Color(red: 0.98, green: 0.35, blue: 0.35)
+        case .idle: return Color(red: 0.23, green: 0.9, blue: 0.42)
+        case .unknown: return .white.opacity(0.5)
+        case .closed: return .white.opacity(0.22)
+        }
+    }
+}
+
+struct ActivityDot: View {
+    let state: ProfileActivityState
+    var size: CGFloat = 6
+    var visible = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var body: some View {
+        Circle().fill(state.color).frame(width: size, height: size)
+            .background {
+                if state == .working {
+                    WorkingDotGlow(visible: visible, reduceMotion: reduceMotion).frame(width: size + 12, height: size + 12)
+                }
+            }
+            .overlay { if state == .unknown { Circle().stroke(.white.opacity(0.6), lineWidth: 1).padding(-2) } }
+            .accessibilityLabel(state.label)
+    }
+}
+
+struct ProfileBadge: View {
+    @ObservedObject var model: DockModel
+    let profile: Profile
+    var size: CGFloat = 54
+    var showStatus = true
+    var activity: ActivitySummary?
+    var activityVisible = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Badges are outlined in the color behind them: black in the strip, the window color in Settings.
+    private var ring: Color { showStatus ? .black : Color(nsColor: .windowBackgroundColor) }
+
+    var body: some View {
+        ZStack(alignment: .bottomTrailing) {
+            Image(nsImage: model.artwork(for: profile, margin: 0)).resizable()
+            .frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: size * 0.26))
+            .overlay(RoundedRectangle(cornerRadius: size * 0.26).stroke(.white.opacity(0.15), lineWidth: 1))
+            .background {
+                IconPulse(working: (activity?.working ?? 0) > 0, visible: activityVisible, reduceMotion: reduceMotion, cornerRadius: size * 0.26)
+                    .frame(width: size + 20, height: size + 20)
+            }
+            if showStatus {
+                if model.opening.contains(profile.id) || model.nativeDockOperations.contains(profile.id) {
+                    ProgressView().controlSize(.mini).padding(4).background(.black, in: Circle()).offset(x: 4, y: 4)
+                } else if model.running[profile.id]?.isEmpty == false {
+                    StatusDot(isOpen: true, size: 10).padding(3).background(.black, in: Circle()).offset(x: 4, y: 4)
+                }
+            }
+        }
+        .opacity(showStatus && model.agentAvailability(profile) == .missing ? 0.55 : 1)
+        .overlay(alignment: .bottomLeading) {
+            if showStatus, let warning = model.tileWarning(profile) {
+                Image(systemName: warning.symbol).font(.system(size: max(9, size * 0.17), weight: .bold)).foregroundStyle(.black)
+                    .frame(width: max(16, size * 0.34), height: max(16, size * 0.34)).background(.orange, in: Circle())
+                    .overlay(Circle().stroke(ring, lineWidth: 2)).offset(x: -4, y: 4)
+                    .accessibilityLabel(warning.text)
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            if let agent = model.terminalAgent(for: profile) ?? model.savedTerminalTool(profile) {
+                Image(nsImage: model.terminalAgentArtwork(agent)).resizable()
+                    .frame(width: max(16, size * 0.36), height: max(16, size * 0.36))
+                    .clipShape(Circle()).overlay(Circle().stroke(ring, lineWidth: 2))
+                    .offset(x: 4, y: -4)
+                    .accessibilityLabel("\(agent.label) terminal")
+                    .help("\(agent.label) is running in this Terminal tab")
+            }
+        }
+        .overlay(alignment: .topLeading) {
+            if let activity, let badge = activity.badge {
+                Text(badge).font(.system(size: 10, weight: .bold, design: .rounded)).monospacedDigit()
+                    .foregroundStyle(.white).padding(.horizontal, 5).frame(minWidth: 19, minHeight: 19)
+                    .background(Color(red: 0.93, green: 0.24, blue: 0.24), in: Capsule())
+                    .overlay(Capsule().stroke(ring, lineWidth: 2)).offset(x: -7, y: -5)
+                    .accessibilityLabel("\(activity.unread ?? 0) completed tasks with unread results")
+            }
+        }
+        .overlay(alignment: .bottomLeading) {
+            if let activity, activity.waiting > 0 {
+                Image(systemName: "pause.fill").font(.system(size: 8, weight: .bold)).foregroundStyle(.black)
+                    .frame(width: 20, height: 20).background(.orange, in: Circle())
+                    .overlay(Circle().stroke(ring, lineWidth: 2)).offset(x: -6, y: 4)
+                    .accessibilityLabel("\(activity.waiting) tasks waiting for you")
+            }
+        }
+    }
+}
+
+struct CompactIslandView: View {
+    @ObservedObject var model: DockModel
+    @ObservedObject var activity: ActivityMonitor
+    @ObservedObject var presentation: IslandPresentation
+    let drag: (DockDragPhase, CGPoint) -> Void
+    var body: some View {
+        GeometryReader { geometry in
+        let visible = WidgetSizing.visibleDots(count: model.displayedProfiles.count, width: geometry.size.width, floating: model.placement == .free)
+        HStack(spacing: 7) {
+            if model.placement == .free { DockDragHandle(drag: drag).frame(width: 22).help("Drag to move Profile Shelf") }
+            BrandMark(size: 11).foregroundStyle(.white.opacity(0.85))
+            Text("Apps").font(.system(size: 10, weight: .medium)).foregroundStyle(.white.opacity(0.9))
+            HStack(spacing: 5) {
+                ForEach(Array(model.displayedProfiles.prefix(visible))) { profile in
+                    ActivityDot(state: ProfileActivityState(summary: activity.entries[profile.id], isOpen: model.running[profile.id]?.isEmpty == false), visible: !presentation.expanded)
+                }
+                if model.displayedProfiles.count > visible { Text("+\(model.displayedProfiles.count - visible)").font(.system(size: 9)).foregroundStyle(.white.opacity(0.6)) }
+            }
+            Image(systemName: presentation.opensUpward ? "chevron.up" : "chevron.down").font(.system(size: 8, weight: .semibold)).foregroundStyle(.white.opacity(0.5))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: model.placement == .free ? .leading : .center)
+        .padding(.horizontal, model.placement == .free ? 8 : 0)
+        .background(.black)
+        .clipShape(UnevenRoundedRectangle(topLeadingRadius: model.placement == .topCenter ? 2 : 12, bottomLeadingRadius: 12, bottomTrailingRadius: 12, topTrailingRadius: model.placement == .topCenter ? 2 : 12))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Profile Shelf, hover here to open. " + statusDescription)
+        .help(statusDescription)
+        }
+    }
+    private var statusDescription: String {
+        model.displayedProfiles.map { "\($0.name): \(ProfileActivityState(summary: activity.entries[$0.id], isOpen: model.running[$0.id]?.isEmpty == false).label)" }.joined(separator: ". ")
+    }
+}
+
+struct IslandView: View {
+    @ObservedObject var model: DockModel
+    @ObservedObject var usage: UsageStore
+    @ObservedObject var activity: ActivityMonitor
+    @ObservedObject var insights: InsightsStore
+    @ObservedObject var presentation: IslandPresentation
+    let notchHeight: CGFloat
+    let settings: () -> Void
+    let drag: (DockDragPhase, CGPoint) -> Void
+    @State private var profilePage = 0
+    @State private var terminalPage = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        GeometryReader { geometry in
+        let columns = presentation.profileColumns
+        let capacity = max(1, columns * presentation.profileRows)
+        let desktopProfiles = Array(model.displayedProfiles.enumerated()).filter { !$0.element.kind.usesTerminal }
+        let terminalProfiles = Array(model.displayedProfiles.enumerated()).filter { $0.element.kind.usesTerminal }
+        let terminalPageCount = max(1, (terminalProfiles.count + capacity - 1) / capacity)
+        let terminalsPage = min(terminalPage, terminalPageCount - 1)
+        let pageCount = max(1, (desktopProfiles.count + capacity - 1) / capacity)
+        let page = min(profilePage, pageCount - 1)
+        let tileWidth = WidgetSizing.tile(count: columns, available: geometry.size.width - 32, scale: model.preferences.scale)
+        ScrollView(.vertical) {
+        VStack(spacing: 13) {
+            if model.preferences.effectiveNotchLayout == .compact && geometry.size.width < 440 {
+                VStack(spacing: 6) {
+                    HStack {
+                        if model.placement == .free { DockDragHandle(drag: drag).frame(width: 22, height: 20) }
+                        Text("Profile Shelf").font(.system(size: 11, weight: .semibold)).lineLimit(1)
+                        NotchLayoutMenu(model: model)
+                        Spacer()
+                    }
+                    HStack(spacing: 8) {
+                        Spacer()
+                        Text(usage.isRefreshing ? "Refreshing…" : "Remaining").font(.system(size: 10)).foregroundStyle(.white.opacity(0.55))
+                        Button { usage.refreshAll(force: true); model.companions.refresh() } label: { Image(systemName: "arrow.clockwise").frame(width: 20, height: 20) }
+                            .accessibilityLabel("Refresh apps, terminals and usage")
+                        ProfileGridMenu(model: model, columns: columns, rows: presentation.profileRows)
+                        Button(action: settings) { Image(systemName: "slider.horizontal.3").frame(width: 22, height: 20) }.accessibilityLabel("Settings")
+                    }
+                }.buttonStyle(.plain).foregroundStyle(.white.opacity(0.75))
+            } else {
+            HStack(spacing: 8) {
+                if model.placement == .free { DockDragHandle(drag: drag).frame(width: 22, height: 20).help("Drag to move Profile Shelf") }
+                Text("Profile Shelf").font(.system(size: 11, weight: .semibold)).foregroundStyle(.white.opacity(0.85))
+                NotchLayoutMenu(model: model)
+                Spacer()
+                Text(usage.isRefreshing ? "Refreshing…" : "Remaining").font(.system(size: 10)).foregroundStyle(.white.opacity(0.55))
+                Button { usage.refreshAll(force: true); model.companions.refresh() } label: {
+                    Image(systemName: "arrow.clockwise").frame(width: 20, height: 20)
+                }.accessibilityLabel("Refresh apps, terminals and usage").help("Find open coding terminals and refresh usage")
+                ProfileGridMenu(model: model, columns: columns, rows: presentation.profileRows)
+                Button(action: settings) {
+                    Image(systemName: "slider.horizontal.3").frame(width: 22, height: 20)
+                }.accessibilityLabel("Settings").help("Profiles, apps, and settings")
+            }.buttonStyle(.plain).foregroundStyle(.white.opacity(0.65))
+            }
+            SignInNoticeBanner(usage: usage, model: model)
+            profileGrid(profiles: Array(desktopProfiles.dropFirst(page * capacity).prefix(capacity)), columns: columns, tileWidth: tileWidth)
+            ProfileGridPagination(model: model, page: $profilePage, count: desktopProfiles.count, capacity: capacity, terminals: false)
+            if model.preferences.effectiveNotchLayout == .compact, !model.displayedProfiles.isEmpty {
+                Button {
+                    if presentation.compactUsageProfileID != nil { presentation.closeCompactUsage() }
+                    else if let profile = model.displayedProfiles.first(where: { $0.id == model.activeProfile }) ?? model.displayedProfiles.first {
+                        presentation.toggleCompactUsage(profile.id)
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: presentation.compactUsageProfileID == nil ? "chevron.right" : "chevron.down")
+                        Text("Usage details")
+                        Spacer()
+                    }.font(.system(size: 10)).foregroundStyle(.white.opacity(0.65)).contentShape(Rectangle())
+                }.buttonStyle(.plain)
+                    .accessibilityLabel(presentation.compactUsageProfileID == nil ? "Expand usage details" : "Collapse usage details")
+            }
+            if model.preferences.effectiveNotchLayout == .compact,
+               let id = presentation.compactUsageProfileID,
+               let selected = model.displayedProfiles.first(where: { $0.id == id }) {
+                CompactNotchUsageDetails(model: model, usage: usage, presentation: presentation, profile: selected)
+            }
+            if model.preferences.showTerminalsSection != false {
+            VStack(spacing: 10) {
+                HStack {
+                    Button { model.setTerminalsExpanded(model.preferences.terminalsExpanded == false) } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: model.preferences.terminalsExpanded == false ? "chevron.right" : "chevron.down")
+                            Image(systemName: "terminal")
+                            Text("Terminals")
+                            Text("\(model.liveTerminalProfiles.count)").monospacedDigit().foregroundStyle(.secondary)
+                        }
+                    }.accessibilityLabel(model.preferences.terminalsExpanded == false ? "Expand terminals" : "Collapse terminals")
+                    Spacer()
+                    Button { model.companions.refresh() } label: { Image(systemName: "arrow.clockwise") }
+                        .accessibilityLabel("Find coding terminals")
+                }.font(.system(size: 11, weight: .medium)).buttonStyle(.plain).foregroundStyle(.white.opacity(0.75))
+                if model.preferences.terminalsExpanded != false {
+                    profileGrid(profiles: Array(terminalProfiles.dropFirst(terminalsPage * capacity).prefix(capacity)), columns: columns, tileWidth: tileWidth)
+                    ProfileGridPagination(model: model, page: $terminalPage, count: terminalProfiles.count, capacity: capacity, terminals: true)
+                    if let error = model.companions.terminalError {
+                        Text(error).font(.system(size: 10)).foregroundStyle(.orange).frame(maxWidth: .infinity, alignment: .leading)
+                    } else if model.liveTerminalProfiles.isEmpty {
+                        Text(model.preferences.discoverTerminals == false ? "Automatic discovery is off in Settings." : "Start a coding agent in Terminal to see it here.")
+                            .font(.system(size: 10)).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+            }
+            if model.displayedProfiles.isEmpty {
+                if model.preferences.profiles.contains(where: { !$0.kind.usesTerminal }) {
+                    Button("All profiles are hidden · Show some", action: settings).buttonStyle(.bordered)
+                } else {
+                    let found = AgentAutoAdd.offers(installed: model.installedAgents ?? [], profiles: model.preferences.profiles, dismissed: Set(model.preferences.dismissedAgentTools ?? [])).count
+                    if found > 0 {
+                        Text(found == 1 ? "1 coding tool found on this Mac" : "\(found) coding tools found on this Mac")
+                            .font(.system(size: 11)).foregroundStyle(.white.opacity(0.7))
+                    }
+                    Button(found > 0 ? "Add your tools" : "Add your first profile", action: settings).buttonStyle(.borderedProminent)
+                }
+            }
+            if model.preferences.showInsightsSection != false { InsightsDrawer(model: model, store: insights, presentation: presentation) }
+            ProfileMessageNotice(model: model, compact: true)
+        }
+        }
+        .scrollIndicators(.automatic)
+        .padding(.top, notchHeight + 13)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .environment(\.colorScheme, .dark)
+        .onChange(of: model.displayedProfiles.count) { _, _ in
+            profilePage = min(profilePage, pageCount - 1); terminalPage = min(terminalPage, terminalPageCount - 1)
+        }
+        .onChange(of: capacity) { _, _ in profilePage = 0; terminalPage = 0 }
+        .onChange(of: model.displayedProfiles.map(\.id)) { _, ids in
+            if let selected = presentation.compactUsageProfileID, !ids.contains(selected) { presentation.closeCompactUsage() }
+        }
+        }
+    }
+
+    private func profileGrid(profiles: [(offset: Int, element: Profile)], columns: Int, tileWidth: CGFloat) -> some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.fixed(tileWidth), spacing: 10 * model.preferences.scale, alignment: .top), count: columns), alignment: .center, spacing: 10) {
+            ForEach(profiles, id: \.element.id) { index, profile in
+                Group {
+                    if model.preferences.effectiveNotchLayout == .compact {
+                        CompactNotchCard(model: model, usage: usage, activity: activity, presentation: presentation, profile: profile, index: index)
+                    } else {
+                        accountCard(profile, index: index, tileWidth: tileWidth)
+                    }
+                }.frame(width: tileWidth)
+                    .modifier(ReorderableProfile(model: model, profile: profile, handle: model.preferences.effectiveNotchLayout == .full, displayedOnly: true))
+                    .contextMenu {
+                        if profile.kind == .codex || profile.kind == .claude {
+                            Button("Open alongside") { model.select(profile, mode: .alongside) }
+                                .disabled(!model.canOpenAlongside(profile))
+                            Divider()
+                        }
+                        Button("Move earlier") { model.moveDisplayed(profile.id, by: -1) }.disabled(index == 0)
+                        Button("Move later") { model.moveDisplayed(profile.id, by: 1) }.disabled(index == model.displayedProfiles.count - 1)
+                        Divider()
+                        Button("Hide from strip") { model.setShownInStrip(profile.id, false) }
+                        if usage.entries[profile.id]?.error?.offersReconnect == true {
+                            Button("Reconnect usage…") { usage.reconnect(profile, home: model.home) }.disabled(usage.isReconnecting(profile))
+                        }
+                        if profile.usesSeparateClaudeAccount, ClaudeResetConnection.connection(configDirectory: usage.claudeConfigPath(profile)).enabled {
+                            Button("Disconnect saved resets") { ClaudeResetConnection.connection(configDirectory: usage.claudeConfigPath(profile)).disconnect() }
+                        }
+                    }
+            }
+        }
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: profiles.map { $0.element.id })
+    }
+
+    private func accountCard(_ profile: Profile, index: Int, tileWidth: CGFloat) -> some View {
+        let active = model.activeProfile == profile.id
+        let isOpen = model.running[profile.id]?.isEmpty == false
+        let entry = usage.entries[profile.id]
+        let taskState = activity.entries[profile.id]
+        let reading = entry?.validatingIdentity == false ? entry?.snapshot : nil
+        // A separate account's status-line report fills in only while its account endpoint has no reading.
+        let statusLine = reading == nil && entry?.error != nil ? usage.statusLineReadings[profile.id] : nil
+        let snapshot = reading ?? statusLine
+        return VStack(spacing: 10) {
+            Button { model.select(profile) } label: {
+                VStack(spacing: 7) {
+                    ProfileBadge(model: model, profile: profile, size: min(52 * model.preferences.scale, tileWidth * 0.42), activity: taskState, activityVisible: presentation.expanded)
+                    Text(profile.name).font(.system(size: 11, weight: active ? .semibold : .medium))
+                        .foregroundStyle(.white.opacity(active ? 1 : 0.8)).lineLimit(1)
+                    if let warning = model.tileWarning(profile) {
+                        Text(warning.text).font(.system(size: 10, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.8).foregroundStyle(.orange)
+                    } else if model.opening.contains(profile.id) {
+                        Text("Opening…").font(.system(size: 10)).lineLimit(1).foregroundStyle(.white.opacity(0.75))
+                    } else if profile.terminalHost != nil, let host = model.companions.window(for: profile)?.title, activityText(taskState) == nil {
+                        Text("In \(host)").font(.system(size: 10)).lineLimit(1).foregroundStyle(.white.opacity(0.75))
+                    } else {
+                    Text(activityText(taskState) ?? (active ? "Active" : (isOpen ? "Open" : (index < 9 ? "⌥⌘\(index + 1)" : "Open"))))
+                        .font(.system(size: 10, weight: (taskState?.working ?? 0) > 0 ? .semibold : .regular))
+                        .lineLimit(1).minimumScaleFactor(0.8)
+                        .foregroundStyle((taskState?.working ?? 0) > 0 ? Color(red: 0.4, green: 0.72, blue: 1) : .white.opacity(active ? 1 : 0.65))
+                    }
+                }
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(model.switchingTargets[profile.kind] != nil)
+            .help("\(profile.name) · \(model.state(profile)) · ⌥⌘\(index + 1)\n" + (model.tileWarning(profile).map { $0.fix + "\n" } ?? "") + activityHelp(taskState, profile: profile))
+            .accessibilityLabel("\(profile.name), \(model.state(profile)). " + activityHelp(taskState, profile: profile))
+            .overlay(alignment: .topTrailing) {
+                // Profile Shelf closes only Terminal.app windows; other terminal apps keep control of their sessions.
+                if isOpen && profile.terminalHost == nil {
+                    Button { model.requestQuit(profile) } label: {
+                        Image(systemName: "xmark").font(.system(size: 8, weight: .bold)).foregroundStyle(.white.opacity(0.9))
+                            .frame(width: 20, height: 20).background(Color(white: 0.22), in: Circle())
+                            .overlay(Circle().stroke(.black, lineWidth: 2))
+                    }.buttonStyle(.plain).disabled(model.closing.contains(profile.id))
+                        .accessibilityLabel("Close \(profile.name)").help("Close \(profile.name)")
+                }
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                if let snapshot, !snapshot.windows.isEmpty {
+                    ForEach(snapshot.windows) { window in UsageWindowView(window: window, now: usage.now) }
+                } else if let error = entry?.error {
+                    Text(error.statusLabel).font(.system(size: 10)).lineLimit(2).minimumScaleFactor(0.8).foregroundStyle(error.needsSignIn ? .orange : .white.opacity(0.5))
+                    if error.needsSignIn {
+                        Button(usage.isReconnecting(profile) ? "Finish in browser…" : "Reconnect") { usage.reconnect(profile, home: model.home) }
+                            .font(.system(size: 9, weight: .medium)).buttonStyle(.plain).foregroundStyle(.orange)
+                            .disabled(usage.isReconnecting(profile)).accessibilityLabel("Reconnect \(profile.name)")
+                            .help(usage.reconnectionMessages[usage.connectionKey(profile)] ?? "Open sign-in for this account. Usage refreshes automatically when you finish.")
+                    } else if error == .claudeConnectionNeeded || error == .claudeOtherAccount {
+                        Button(usage.isReconnecting(profile) ? "Finish in browser…" : error == .claudeOtherAccount ? "Reconnect" : "Connect…") { usage.reconnect(profile, home: model.home) }
+                            .font(.system(size: 9, weight: .medium)).buttonStyle(.plain).foregroundStyle(.white.opacity(0.75))
+                            .disabled(usage.isReconnecting(profile)).accessibilityLabel("Connect usage for \(profile.name)")
+                            .help(usage.reconnectionMessages[usage.connectionKey(profile)] ?? error.message)
+                    } else if error.offersReconnect {
+                        // A stale token is not a sign-in failure: refresh first, Reconnect only as the secondary action.
+                        HStack(spacing: 8) {
+                            Button("Refresh") { usage.refresh(profile, force: true) }
+                                .font(.system(size: 9)).buttonStyle(.plain).foregroundStyle(.white.opacity(0.75)).help(error.message)
+                            Button(usage.isReconnecting(profile) ? "Finish in browser…" : "Reconnect") { usage.reconnect(profile, home: model.home) }
+                                .font(.system(size: 9)).buttonStyle(.plain).foregroundStyle(.white.opacity(0.5))
+                                .disabled(usage.isReconnecting(profile)).accessibilityLabel("Reconnect \(profile.name)")
+                                .help(usage.reconnectionMessages[usage.connectionKey(profile)] ?? "Sign in again now instead of waiting for Claude Code.")
+                        }
+                    } else {
+                        Button("Try again") { usage.refresh(profile, force: true) }
+                            .font(.system(size: 9)).buttonStyle(.plain).foregroundStyle(.white.opacity(0.75)).help(error.message)
+                    }
+                } else {
+                    Text(profile.kind == .agent ? profile.tileCaption : (profile.kind == .codex || profile.usesClaudeAccountUsage) ? (snapshot == nil ? "Loading usage…" : "No usage data") : (profile.kind == .terminal ? "Terminal window" : "Usage not reported yet"))
+                        .font(.system(size: 10)).foregroundStyle(.white.opacity(0.45))
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: IslandLayout.usageHeight(rows: snapshot?.windows.count ?? 1), maxHeight: IslandLayout.usageHeight(rows: snapshot?.windows.count ?? 1), alignment: .topLeading)
+            .help(usageSource(profile, statusLine: statusLine != nil) + (snapshot.map { "Updated at \(Self.absoluteDate($0.fetchedAt))." } ?? "Usage for this account."))
+            if profile.usesClaudeAccountUsage && (entry?.error == .claudeConnectionNeeded || entry?.error == .claudeOtherAccount) {
+                if statusLine != nil {
+                    Button("Connect usage…") { usage.reconnect(profile, home: model.home) }
+                        .font(.system(size: 10)).buttonStyle(.plain).foregroundStyle(.white.opacity(0.65)).frame(height: 20)
+                        .disabled(usage.isReconnecting(profile)).help(entry?.error?.message ?? "")
+                } else { Text(profile.usesSeparateClaudeAccount ? "Separate account" : " ").font(.system(size: 10)).foregroundStyle(.white.opacity(0.55)).frame(height: 20) }
+            } else if profile.usesClaudeAccountUsage && snapshot?.bankedResets == nil {
+                Button("Connect saved resets…") { ClaudeResetConnection.connection(configDirectory: usage.claudeConfigPath(profile)).connect() }
+                    .font(.system(size: 10)).buttonStyle(.plain).foregroundStyle(.white.opacity(0.65)).frame(height: 20)
+                    .help("Sign in to Claude once to refresh saved resets automatically. No reset is consumed.")
+            } else if profile.kind == .codex || profile.usesClaudeAccountUsage {
+            ResetInventoryView(snapshot: snapshot, now: usage.now, expanded: presentation.resetDetails.contains(profile.id)) {
+                presentation.toggleResetDetails(profile.id)
+            }
+            .help(resetHelp(snapshot))
+            } else {
+                // The tool's name only where the profile's own name does not already say it.
+                let footer = profile.kind == .agent ? (profile.agentTool?.name ?? profile.tileCaption) : profile.tileCaption
+                Text(footer == profile.name ? " " : footer).font(.system(size: 10)).foregroundStyle(.white.opacity(0.55)).frame(height: 20)
+            }
+            // Grok Bot rewrites its own reading only now and then, so an hour-old reading is normal there.
+            if let snapshot, (entry?.error != nil && statusLine == nil) || usage.now.timeIntervalSince(snapshot.fetchedAt) > (profile.kind == .agent ? 3600 : profile.usesClaudeAccountUsage && statusLine == nil ? 360 : 90) {
+                Text("Updated \(Self.age(snapshot.fetchedAt, now: usage.now)) ago")
+                    .font(.system(size: 8)).foregroundStyle(.orange.opacity(0.9))
+                    .help(profile.kind == .agent ? "Last reading saved by \(profile.agentTool?.name ?? profile.name). It updates while the app is open." : statusLine != nil ? "Last status-line report from this account's Claude Code." : entry?.error?.message ?? "Refreshing usage data.")
+            } else { Text(" ").font(.system(size: 8)).accessibilityHidden(true) }
+        }
+        .padding(.horizontal, 8)
+        .padding(.top, 12)
+        .padding(.bottom, 6)
+        .frame(maxWidth: .infinity)
+        .background(active ? .white.opacity(0.075) : .white.opacity(0.025), in: RoundedRectangle(cornerRadius: 17))
+        .overlay(RoundedRectangle(cornerRadius: 17).stroke(active ? .white.opacity(0.2) : .clear, lineWidth: 1))
+    }
+
+    private func activityText(_ state: ActivitySummary?) -> String? {
+        state?.profileStatusText
+    }
+
+    private func activityHelp(_ state: ActivitySummary?, profile: Profile) -> String {
+        if profile.kind == .agent, profile.agentTool != nil { return profile.accountCaption }
+        if profile.kind != .codex {
+            if model.terminalAgent(for: profile) == .codex { return "Codex is running in this Terminal tab. Per-tab Codex CLI task activity and usage are not reported by this integration." }
+            if let tool = model.terminalAgent(for: profile)?.tool, !tool.legacy { return tool.runningHelp }
+            if profile.kind == .terminal, state?.working == 0, state?.waiting == 0 { return "This Terminal tab. Claude Code activity appears when connected." }
+            return "Tracks connected local Claude Code sessions. Claude Chat and Cowork activity are not available. " + (state?.liveAvailable == true ? "" : "Connect Claude Code in Profiles to enable activity.")
+        }
+        guard let state else { return "Loading task status…" }
+        let unread = state.unread.map { "\($0) completed tasks with unread results." } ?? "Unread results unknown."
+        let live = state.liveAvailable ? "\(state.working) working, \(state.waiting) waiting for you." : (state.appOpen ? state.connectionIssue?.explanation ?? "Live task status unavailable." : "Desktop profile closed.")
+        return "\(unread) \(live)\nTracks local Work/Codex tasks. Ordinary ChatGPT chats are not counted."
+    }
+
+    private func usageSource(_ profile: Profile, statusLine: Bool) -> String {
+        if profile.kind == .agent { return GrokBotUsage.dataDirectory(for: profile, home: model.home) != nil ? "Weekly usage as last read by Grok Bot. " : "" }
+        guard profile.usesClaudeAccountUsage else { return "" }
+        if statusLine { return "Reported by this account's Claude Code status line until account usage is connected. " }
+        return profile.usesSeparateClaudeAccount ? "Claude Code account usage for this separate account. " : "Claude Code account usage, shared by Claude tiles. "
+    }
+
+    private func resetHelp(_ snapshot: UsageSnapshot?) -> String {
+        guard let snapshot, let count = snapshot.bankedResets else { return "The number of saved resets is unavailable." }
+        var lines = ["\(count) saved \(count == 1 ? "reset" : "resets")."]
+        if let applicable = snapshot.applicableResets { lines.append("Available now: \(applicable).") }
+        if let dates = snapshot.resetExpiries, !dates.isEmpty {
+            lines += dates.map { "Expires: \(Self.absoluteDate($0))." }
+        }
+        lines.append("Updated at \(Self.absoluteDate(snapshot.fetchedAt)).")
+        return lines.joined(separator: "\n")
+    }
+
+    static func absoluteDate(_ date: Date) -> String {
+        date.formatted(Date.FormatStyle(date: .abbreviated, time: .shortened).locale(Locale(identifier: "en_US")))
+    }
+    static func age(_ date: Date, now: Date) -> String {
+        let minutes = max(1, Int(now.timeIntervalSince(date) / 60))
+        return minutes < 60 ? "\(minutes) min" : "\(minutes / 60) h"
+    }
+}
+
+struct ResetInventoryView: View {
+    let snapshot: UsageSnapshot?
+    let now: Date
+    let expanded: Bool
+    let toggle: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button(action: toggle) {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.counterclockwise").font(.system(size: 9))
+                    if let count = snapshot?.bankedResets {
+                        ViewThatFits(in: .horizontal) {
+                            Text("\(count) \(count == 1 ? "reset" : "resets") saved").fixedSize()
+                            Text("Resets: \(count)").fixedSize()
+                        }
+                    } else { Text("Resets unknown") }
+                    Spacer(minLength: 0)
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                }
+                .frame(minHeight: 20).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 10)).foregroundStyle(.white.opacity(snapshot?.bankedResets == nil ? 0.55 : 0.85))
+            .accessibilityLabel(snapshot?.bankedResets.map { "\($0) saved resets, expiry times" } ?? "Saved resets, expiry unknown")
+            .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+            .accessibilityHint("Click to \(expanded ? "hide expiry times" : "show expiry times").")
+            if expanded {
+                let details = ResetExpiryDetails(count: snapshot?.bankedResets, expiries: snapshot?.resetExpiries)
+                ScrollView(.vertical) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(Array(details.dates.enumerated()), id: \.offset) { index, expiry in
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Reset \(index + 1)").font(.system(size: 10)).foregroundStyle(.white.opacity(0.6))
+                                let countdown = ResetExpiryDetails.countdown(until: expiry, now: now)
+                                ViewThatFits(in: .horizontal) {
+                                    Text(countdown).fixedSize()
+                                    Text(countdown.replacingOccurrences(of: "Expires in", with: "In")
+                                        .replacingOccurrences(of: "Expires within", with: "Within"))
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                .font(.system(size: 11, weight: .medium)).monospacedDigit()
+                                .foregroundStyle(expiry.timeIntervalSince(now) <= 86400 ? .orange : .white.opacity(0.9))
+                                .accessibilityLabel(countdown)
+                            }
+                            .accessibilityElement(children: .combine)
+                            .help("Expires at \(IslandView.absoluteDate(expiry)).")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        if let message = details.message {
+                            Text(message).font(.system(size: 11)).foregroundStyle(.white.opacity(0.65))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(height: IslandLayout.resetDetailsHeight - 8)
+                .scrollIndicators(.never)
+            }
+        }
+    }
+}
+
+struct UsageWindowView: View {
+    let window: UsageWindow
+    let now: Date
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private var tint: Color { UsageTint.remaining(window.remainingPercent).color }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(window.title).foregroundStyle(.white.opacity(0.7))
+                Spacer(minLength: 3)
+                Text("\(Int(window.remainingPercent.rounded()))%").monospacedDigit().foregroundStyle(tint)
+            }.font(.system(size: 11, weight: .medium))
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.45), value: window.remainingPercent)
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(.white.opacity(0.12))
+                    Capsule().fill(tint).frame(width: proxy.size.width * window.remainingPercent / 100)
+                }
+            }.frame(height: 4)
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.45), value: window.remainingPercent)
+            ViewThatFits(in: .horizontal) {
+                Text(resetText).fixedSize()
+                Text(resetText.replacingOccurrences(of: "Reset in", with: "Reset in")
+                    .replacingOccurrences(of: "Reset time unknown", with: "Reset unknown")
+                    .replacingOccurrences(of: "Reset refreshing", with: "Reset refreshing")).fixedSize()
+            }.font(.system(size: 11, weight: .medium)).foregroundStyle(.white.opacity(0.8)).lineLimit(1)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(window.title), \(Int(window.remainingPercent.rounded())) percent remaining. \(resetText)")
+        .help(window.resetsAt.map { "\(Int(window.usedPercent.rounded()))% used.\nResets at \(IslandView.absoluteDate($0))." } ?? "Reset time unknown.")
+    }
+
+    private var resetText: String {
+        guard let reset = window.resetsAt else { return "Reset time unknown" }
+        let seconds = reset.timeIntervalSince(now)
+        guard seconds > 0 else { return "Reset refreshing" }
+        let hours = Int(seconds / 3600), days = hours / 24
+        if days > 0 { return "Reset in \(days)d \(hours % 24)h" }
+        if hours > 0 { return "Reset in \(hours)h \(Int(seconds / 60) % 60)m" }
+        return "Reset in \(max(1, Int(seconds / 60))) min"
+    }
+}

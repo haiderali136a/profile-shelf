@@ -1,0 +1,18 @@
+{
+  "size": 64,
+  "cards": [
+    10,
+    26,
+    42
+  ],
+  "cardY": 20,
+  "cardWidth": 12,
+  "cardHeight": 32,
+  "radius": 4,
+  "shelf": [
+    6,
+    10,
+    52,
+    4
+  ]
+}

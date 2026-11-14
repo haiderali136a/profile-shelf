@@ -1,0 +1,653 @@
+import AppKit
+import SwiftUI
+import Carbon
+import DockCore
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate, NSMenuItemValidation {
+    let model: DockModel
+    let previewMode = CommandLine.arguments.contains("--preview") || Bundle.main.object(forInfoDictionaryKey: "ProfileShelfContextPreview") as? Bool == true
+    let usage = UsageStore()
+    let insights = InsightsStore()
+    let activity = ActivityMonitor()
+    let loginItem = LoginItemModel()
+    let appUpdates = AppUpdates()
+    let selfUpdates = ProfileShelfUpdates()
+    let cues = ActivityCues()
+    var islands: [IslandController] = []
+    let iconAppearance = AppIconController()
+    let menuBarItem = MenuBarStatusItem()
+    var status: NSStatusItem? { menuBarItem.item }
+    let quickPopoverDismissal = MenuBarPopoverDismissal()
+    var menuProfileIDs = UserDefaults.standard.dictionary(forKey: "ProfileShelf.MenuProfiles") as? [String: String] ?? [:]
+    let quickPopover = NSPopover()
+    var quickWindow: NSWindow?
+    var settingsWindow: NSWindow?
+    private var settingsOpen = false
+    var hotKeys: [EventHotKeyRef] = []
+    var eventHandler: EventHandlerRef?
+    private var globalMouseMonitor: Any?
+    private var localMouseMonitor: Any?
+    private var mouseEvents = 0
+    private var displayedProfileIDs: [String] = []
+    private var displayConfiguration: DisplayConfiguration?
+
+    override init() {
+        let contextPreview = Bundle.main.object(forInfoDictionaryKey: "ProfileShelfContextPreview") as? Bool == true
+        if CommandLine.arguments.contains("--preview") || contextPreview {
+            let arguments = CommandLine.arguments
+            let supplied = arguments.firstIndex(of: "--preview-home").flatMap { $0 + 1 < arguments.count ? URL(fileURLWithPath: arguments[$0 + 1]) : nil }
+            let directory = supplied ?? FileManager.default.temporaryDirectory.appendingPathComponent("profile-shelf-preview-" + UUID().uuidString)
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            model = DockModel(home: directory)
+        } else { model = DockModel() }
+        super.init()
+        if previewMode, CommandLine.arguments.contains("--preview-notice"), let profile = model.preferences.profiles.first {
+            // Keep notice/retry visual checks inside the isolated preview home.
+            model.unreadableProcesses = true
+            model.showProfileMessage("Couldn’t bring \(profile.name) to the front.", for: profile)
+        }
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // One companion process, regardless of how often Finder or the Dock opens it.
+        if !previewMode, let other = NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.haiderali136a.profileshelf").first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
+            DistributedNotificationCenter.default().postNotificationName(Notification.Name("io.github.haiderali136a.profileshelf.show"), object: nil)
+            _ = other
+            NSApp.terminate(nil)
+            return
+        }
+        if !previewMode, !UserDefaults.standard.bool(forKey: "ProfileShelf.Initialized") {
+            model.preferences.showDockIcon = true
+            model.preferences.showMenuBarIcon = true
+            model.save()
+            UserDefaults.standard.set(true, forKey: "ProfileShelf.Initialized")
+        }
+        applyVisibility()
+        usage.configure(previewMode ? [] : model.stripProfiles)
+        insights.prepare(profiles: model.preferences.profiles, home: model.home)
+        if !previewMode {
+            usage.refreshAll()
+            NotificationCenter.default.publisher(for: ClaudeResetConnection.changed).sink { [weak self] note in
+                self?.usage.claudeConnectionChanged(configDirectory: note.userInfo?[ClaudeResetConnection.configDirectoryKey] as? String)
+            }.store(in: &subscriptions)
+            NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification).sink { [weak self] _ in
+                self?.usage.refreshAll()
+            }.store(in: &subscriptions)
+        }
+        activity.configure(previewMode ? [] : model.activityProfiles, running: Set(model.running.keys))
+        if !previewMode { rebuildIslands(); startMouseMonitoring() }
+        else if CommandLine.arguments.contains("--preview-strip") { rebuildIslands(); startMouseMonitoring() }
+        applyVisibility()
+        configureMenu()
+        if !previewMode {
+            updateMenuBarSummary()
+            usage.$entries.receive(on: RunLoop.main).sink { [weak self] _ in self?.updateMenuBarSummary() }.store(in: &subscriptions)
+            usage.$now.dropFirst().receive(on: RunLoop.main).sink { [weak self] _ in self?.updateMenuBarSummary() }.store(in: &subscriptions)
+            usage.$statusLineReadings.receive(on: RunLoop.main).sink { [weak self] _ in self?.updateMenuBarSummary() }.store(in: &subscriptions)
+            model.$activeProfile.receive(on: RunLoop.main).sink { [weak self] id in self?.rememberUsageProfile(id) }.store(in: &subscriptions)
+            model.$running.receive(on: RunLoop.main).sink { [weak self] _ in self?.updateMenuBarSummary() }.store(in: &subscriptions)
+        }
+        if !previewMode {
+            applyReminderPreferences()
+            usage.onConnectionLost = { [weak self] _ in self?.presentSignInNotice() }
+            usage.$entries.receive(on: RunLoop.main).map { [weak self] _ in self?.usage.disconnectedProfiles.map(\.id) ?? [] }.removeDuplicates().sink { [weak self] _ in
+                self?.configureMenu()
+            }.store(in: &subscriptions)
+            // The strip reserves room for the notice only while it lists accounts, and closes once it is handled.
+            Publishers.CombineLatest4(usage.$entries, usage.$dismissedNotices, usage.$mutedConnections, usage.$remindersEnabled)
+                .receive(on: RunLoop.main).map { [weak self] _ in self?.usage.signInNotices.map(\.id) ?? [] }.removeDuplicates().dropFirst()
+                .sink { [weak self] ids in
+                    guard let self else { return }
+                    DispatchQueue.main.async {
+                        self.islands.forEach { $0.updateLayout() }
+                        if ids.isEmpty { self.islands.forEach { $0.endAttention() } }
+                    }
+                }.store(in: &subscriptions)
+        }
+        iconAppearance.update(model.preferences.appIconAppearance ?? .auto)
+        selfUpdates.mayUpdate = { [weak self] in self?.appUpdates.busy == false && self?.model.nativeDockOperations.isEmpty == true && self?.model.switchingTargets.isEmpty == true }
+        if !previewMode { selfUpdates.start() }
+        activity.$event.compactMap { $0 }.sink { [weak self] event in
+            guard let self, !self.previewMode else { return }
+            self.cues.receive(event, model: self.model)
+        }.store(in: &subscriptions)
+        if !previewMode { registerHotKeys() }
+        if model.preferences.profiles.isEmpty || previewMode || CommandLine.arguments.contains("--settings") || CommandLine.arguments.contains("--context-settings") || CommandLine.arguments.contains("--search-chats") { showSettings() }
+        if !previewMode, !model.preferences.profiles.isEmpty, !CommandLine.arguments.contains("--settings"), !CommandLine.arguments.contains("--search-chats"), !CommandLine.arguments.contains("--context-settings") { showQuickWindow() }
+        model.onPreferencesChanged = { [weak self] in
+            guard let self else { return }
+            self.usage.configure(self.previewMode ? [] : self.model.stripProfiles)
+            self.applyReminderPreferences()
+            self.insights.prepare(profiles: self.model.preferences.profiles, home: self.model.home)
+            self.activity.configure(self.previewMode ? [] : self.model.activityProfiles, running: Set(self.model.running.keys))
+            if !self.previewMode, self.islands.first?.layout.placement != self.model.placement || (self.model.preferences.showNotch == false && !self.islands.isEmpty) { self.cues.dismiss(); self.rebuildIslands() }
+            else { self.islands.forEach { $0.updateLayout() } }
+            self.applyVisibility()
+            self.iconAppearance.update(self.model.preferences.appIconAppearance ?? .auto)
+            self.configureMenu(); self.updateMenuBarSummary(); if !self.previewMode { self.registerHotKeys() }
+        }
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(openFromShortcut(_:)), name: Notification.Name("ProfileShelf.OpenProfile"), object: nil)
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(showPanel), name: Notification.Name("io.github.haiderali136a.profileshelf.show"), object: nil)
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(writeDiagnostics), name: Notification.Name("io.github.haiderali136a.profileshelf.diagnostics"), object: nil)
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(measureAnimations(_:)), name: Notification.Name("io.github.haiderali136a.profileshelf.measure"), object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(screenChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        model.$companionRevision.dropFirst().sink { [weak self] _ in
+            guard let self else { return }
+            self.activity.updateCompanions(model: self.model)
+            self.usage.updateCompanions(model: self.model)
+            let ids = self.model.displayedProfiles.map(\.id)
+            if ids != self.displayedProfileIDs {
+                self.displayedProfileIDs = ids
+                self.islands.forEach { $0.updateLayout() }
+                self.configureMenu(); self.updateMenuBarSummary(); if !self.previewMode { self.registerHotKeys() }
+            }
+        }.store(in: &subscriptions)
+        model.$message.dropFirst().sink { [weak self] _ in DispatchQueue.main.async { self?.islands.forEach { $0.updateLayout() } } }.store(in: &subscriptions)
+        model.$running.dropFirst().sink { [weak self] running in
+            guard let self else { return }
+            self.activity.configure(self.previewMode ? [] : self.model.activityProfiles, running: Set(running.keys))
+        }.store(in: &subscriptions)
+        if !previewMode { model.companions.start() }
+        if let index = CommandLine.arguments.firstIndex(of: "--select-profile"), CommandLine.arguments.indices.contains(index + 1),
+           let profile = model.preferences.profiles.first(where: { $0.id == CommandLine.arguments[index + 1] }) {
+            rememberUsageProfile(profile.id); model.select(profile)
+        }
+    }
+
+    private var subscriptions = Set<AnyCancellable>()
+
+    private func startMouseMonitoring() {
+        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pointerMoved() }
+        }
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+            MainActor.assumeIsolated { self?.pointerMoved() }
+            return event
+        }
+    }
+
+    private func pointerMoved() {
+        mouseEvents += 1
+        let point = NSEvent.mouseLocation
+        islands.forEach { $0.pointerMoved(to: point) }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        quickPopover.performClose(nil)
+        quickPopoverDismissal.stop()
+        menuBarItem.shutdown()
+        iconAppearance.shutdown()
+        cues.shutdown()
+        if let globalMouseMonitor { NSEvent.removeMonitor(globalMouseMonitor) }
+        if let localMouseMonitor { NSEvent.removeMonitor(localMouseMonitor) }
+        islands.forEach { $0.shutdown() }
+        usage.shutdown()
+        insights.shutdown()
+        activity.shutdown()
+        model.companions.stop()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if model.upgradingShortcuts || !model.shortcutOperations.isEmpty {
+            showSettings()
+            return .terminateCancel
+        }
+        if !model.switchingTargets.isEmpty {
+            model.message = "Wait for the account switch to finish before quitting Profile Shelf."
+            showQuickWindow()
+            return .terminateCancel
+        }
+        if !model.nativeDockOperations.isEmpty {
+            model.message = "Keep Profile Shelf open until the native Dock app finishes building."
+            showSettings()
+            return .terminateCancel
+        }
+        guard appUpdates.busy else { return .terminateNow }
+        model.message = appUpdates.canCancel ? "Cancel the ChatGPT download before quitting Profile Shelf." : "Keep Profile Shelf open until the ChatGPT installation finishes."
+        showSettings()
+        return .terminateCancel
+    }
+
+    func rebuildIslands() {
+        islands.forEach { $0.shutdown() }
+        islands = []
+        displayConfiguration = Self.currentDisplayConfiguration()
+        guard model.preferences.showNotch != false else { return }
+        islands = NSScreen.screens.map { screen in IslandController(screen: screen, model: model, usage: usage, activity: activity, insights: insights, settings: { [weak self] in self?.showSettings() }) }
+    }
+
+    static func currentDisplayConfiguration() -> DisplayConfiguration {
+        DisplayConfiguration(NSScreen.screens.map { screen in
+            let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+            return .init(id: id, frame: screen.frame, notchHeight: screen.safeAreaInsets.top, scale: screen.backingScaleFactor)
+        })
+    }
+
+    @objc func screenChanged() {
+        guard !previewMode else { return }
+        // App launches and quits resize the Dock and post this notification too. Keep an
+        // open panel for those; rebuild only when a display itself changed.
+        guard Self.currentDisplayConfiguration().needsRebuild(comparedTo: displayConfiguration) else {
+            islands.forEach { $0.updateLayout() }
+            return
+        }
+        cues.dismiss(); rebuildIslands()
+    }
+    func applyReminderPreferences() {
+        usage.remindersEnabled = model.preferences.signInReminders != false
+        usage.mutedConnections = Set(model.preferences.mutedSignInReminders ?? [])
+    }
+    /// Drop the strip down on the display with the pointer, instead of opening a separate window.
+    func presentSignInNotice(force: Bool = false) {
+        guard !previewMode, force || !usage.signInNotices.isEmpty else { return }
+        let mouse = NSEvent.mouseLocation
+        let island = islands.first { $0.screen.frame.contains(mouse) } ?? islands.first
+        island?.presentAttention()
+    }
+    @objc func showPanel() { islands.forEach { $0.showPanel() } }
+    @objc func measureAnimations(_ notification: Notification) { islands.forEach { $0.measureAnimations = notification.object as? String == "start" } }
+    @objc func writeDiagnostics(_ notification: Notification) {
+        let destination = model.settingsURL.deletingLastPathComponent().appendingPathComponent("live-diagnostics.json")
+        loginItem.refresh()
+        let output: [String: Any] = ["companions": ["codingTerminals": model.liveTerminalProfiles.count, "terminalTabs": model.companions.windows.count, "terminalError": model.companions.terminalError as Any? ?? NSNull(), "terminalsExpanded": model.preferences.terminalsExpanded != false, "discoveryEnabled": model.preferences.discoverTerminals != false], "requestID": notification.object as? String ?? "", "islands": islands.map(\.diagnostics), "usage": usage.diagnostics, "activity": activity.diagnostics, "mouseEvents": mouseEvents, "globalMouseMonitor": globalMouseMonitor != nil, "localMouseMonitor": localMouseMonitor != nil, "profileRefreshes": model.refreshCount, "loginItem": loginItem.statusName, "menuBarItem": status?.isVisible ?? false, "pid": ProcessInfo.processInfo.processIdentifier, "iconAppearance": (model.preferences.appIconAppearance ?? .auto).rawValue]
+        if let data = try? JSONSerialization.data(withJSONObject: output, options: [.prettyPrinted, .sortedKeys]) {
+            try? FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: destination, options: .atomic)
+        }
+    }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if settingsOpen { showSettings() } else { showQuickWindow() }
+        return true
+    }
+    @objc func showCompactWindow() { showQuickWindow() }
+
+    @objc func statusClick() {
+        if NSApp.currentEvent?.type != .rightMouseUp { toggleQuickPanel(); return }
+        quickPopover.performClose(nil)
+        guard let status, let menu = statusMenu else { return }
+        status.menu = menu
+        status.button?.performClick(nil)
+        status.menu = nil
+    }
+
+    var statusMenu: NSMenu?
+    func menuWillOpen(_ menu: NSMenu) {
+        model.refresh()
+        for item in menu.items {
+            if item.action == #selector(reconnectAccount(_:)) { item.toolTip = "Sign in again to restore account usage"; continue }
+            guard let id = item.representedObject as? String,
+                  let profile = model.preferences.profiles.first(where: { $0.id == id }) else { continue }
+            item.state = model.activeProfile == id ? .on : .off
+            let isOpen = model.running[id]?.isEmpty == false
+            item.toolTip = isOpen ? "Show \(profile.name) — already open" : item.action == #selector(menuAlongside(_:)) ? "Open \(profile.name) alongside other accounts" : "Switch to \(profile.name)"
+        }
+    }
+
+    func configureMenu() {
+        let menu = NSMenu()
+        menu.delegate = self
+        menu.addItem(.sectionHeader(title: "Switch Profile"))
+        if model.preferences.profiles.isEmpty { menu.addItem(withTitle: "No profiles yet", action: nil, keyEquivalent: "") }
+        for (index, profile) in model.displayedProfiles.enumerated() {
+            let item = NSMenuItem(title: profile.name, action: #selector(menuSelect(_:)), keyEquivalent: index < 9 ? String(index + 1) : "")
+            item.keyEquivalentModifierMask = [.command, .option]
+            item.representedObject = profile.id
+            item.target = self
+            let artwork = model.artwork(for: profile)
+            item.image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in
+                artwork.draw(in: rect)
+                return true
+            }
+            menu.addItem(item)
+        }
+        let parallel = NSMenuItem(title: "Open alongside", action: nil, keyEquivalent: "")
+        let parallelMenu = NSMenu(title: "Open alongside")
+        parallelMenu.delegate = self
+        for profile in model.displayedProfiles where profile.kind == .codex || profile.kind == .claude {
+            let item = parallelMenu.addItem(withTitle: "\(profile.kind == .codex ? "ChatGPT" : "Claude") · \(profile.name)", action: #selector(menuAlongside(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = profile.id
+        }
+        parallel.submenu = parallelMenu
+        menu.addItem(parallel)
+        menu.addItem(.separator())
+        if !usage.disconnectedProfiles.isEmpty {
+            menu.addItem(.sectionHeader(title: "Sign-in needed"))
+            for profile in usage.disconnectedProfiles {
+                let title = profile.usesClaudeAccountUsage && !profile.usesSeparateClaudeAccount ? "Reconnect Claude account…" : "Reconnect \(profile.name)…"
+                let item = menu.addItem(withTitle: title, action: #selector(reconnectAccount(_:)), keyEquivalent: "")
+                item.target = self; item.representedObject = profile.id
+            }
+            menu.addItem(.separator())
+        }
+        menu.addItem(withTitle: "Open Profile Shelf…", action: #selector(showProfiles), keyEquivalent: "0").target = self
+        menu.addItem(withTitle: "Add Profile…", action: #selector(addProfile), keyEquivalent: "n").target = self
+        menu.addItem(withTitle: "Search Chats…", action: #selector(showSearch), keyEquivalent: "f").target = self
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Updates…", action: #selector(showUpdateSettings), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Settings…", action: #selector(showGeneralSettings), keyEquivalent: ",").target = self
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Quit Profile Shelf", action: #selector(quit), keyEquivalent: "q").target = self
+        statusMenu = menu
+        let main = NSMenu()
+        let application = NSMenu(title: "Profile Shelf")
+        application.addItem(withTitle: "About Profile Shelf", action: #selector(about), keyEquivalent: "").target = self
+        application.addItem(.separator())
+        application.addItem(withTitle: "Settings…", action: #selector(showGeneralSettings), keyEquivalent: ",").target = self
+        if Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") != nil {
+            application.addItem(withTitle: "Check Profile Shelf for Updates…", action: #selector(checkProfileShelfUpdates), keyEquivalent: "").target = self
+        }
+        application.addItem(.separator())
+        application.addItem(withTitle: "Hide Profile Shelf", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        let hideOthers = application.addItem(withTitle: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        application.addItem(withTitle: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
+        application.addItem(.separator())
+        application.addItem(withTitle: "Quit Profile Shelf", action: #selector(quit), keyEquivalent: "q").target = self
+        application.delegate = self
+        let appMenu = NSMenuItem(title: "Profile Shelf", action: nil, keyEquivalent: "")
+        appMenu.submenu = application
+        main.addItem(appMenu)
+        let profilesItem = NSMenuItem(title: "Profiles", action: nil, keyEquivalent: "")
+        let profiles = NSMenu(title: "Profiles")
+        for item in menu.items where item.representedObject is String { if let copy = item.copy() as? NSMenuItem { profiles.addItem(copy) } }
+        profiles.addItem(.separator())
+        profiles.addItem(withTitle: "Add Profile…", action: #selector(addProfile), keyEquivalent: "n").target = self
+        profiles.addItem(withTitle: "Manage Profiles…", action: #selector(showProfiles), keyEquivalent: "0").target = self
+        profiles.addItem(withTitle: "Search Chats…", action: #selector(showSearch), keyEquivalent: "f").target = self
+        profiles.delegate = self
+        profilesItem.submenu = profiles; main.addItem(profilesItem)
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+        editItem.submenu = edit
+        main.addItem(editItem)
+        let windowItem = NSMenuItem(title: "Window", action: nil, keyEquivalent: "")
+        let windows = NSMenu(title: "Window")
+        windows.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windows.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        windows.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowItem.submenu = windows; main.addItem(windowItem)
+        NSApp.windowsMenu = windows
+        let help = NSMenu(title: "Help")
+        help.addItem(withTitle: "Profile Shelf Help", action: #selector(showHelp), keyEquivalent: "?").target = self
+        help.addItem(withTitle: "Contribute to Profile Shelf…", action: #selector(showSupport), keyEquivalent: "").target = self
+        help.addItem(withTitle: "About Profile Shelf…", action: #selector(about), keyEquivalent: "").target = self
+        let helpItem = NSMenuItem(title: "Help", action: nil, keyEquivalent: "")
+        helpItem.submenu = help; main.addItem(helpItem)
+        NSApp.helpMenu = help
+        NSApp.mainMenu = main
+    }
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(menuSelect(_:)) || menuItem.action == #selector(menuAlongside(_:)),
+           let id = menuItem.representedObject as? String, let profile = model.preferences.profiles.first(where: { $0.id == id }) {
+            if menuItem.action == #selector(menuAlongside(_:)) { return model.canOpenAlongside(profile) }
+            return model.switchingTargets[profile.kind] == nil && !model.opening.contains(id) && !model.closing.contains(id)
+        }
+        if menuItem.action == #selector(quit) { return model.switchingTargets.isEmpty && model.shortcutOperations.isEmpty && !model.upgradingShortcuts }
+        if menuItem.action == #selector(checkProfileShelfUpdates) { return selfUpdates.canCheck && !appUpdates.busy && model.nativeDockOperations.isEmpty }
+        return true
+    }
+    @objc func reconnectAccount(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let profile = model.preferences.profiles.first(where: { $0.id == id }) else { return }
+        usage.reconnect(profile, home: model.home)
+        presentSignInNotice(force: true)
+    }
+    @objc func about() { showDestination(.profileShelfShowAbout) }
+    private func showDestination(_ notification: Notification.Name) {
+        showSettings()
+        DispatchQueue.main.async { NotificationCenter.default.post(name: notification, object: nil) }
+    }
+    @objc func showProfiles() { showDestination(.profileShelfShowProfiles) }
+    @objc func addProfile() { showDestination(.profileShelfAddProfile) }
+    @objc func showSearch() { showDestination(.profileShelfShowSearch) }
+    @objc func showSupport() { showDestination(.profileShelfShowSupport) }
+    @objc func showHelp() { NSWorkspace.shared.open(AppBrand.guide) }
+    @objc func showGeneralSettings() {
+        showSettings()
+        DispatchQueue.main.async { NotificationCenter.default.post(name: .profileShelfShowGeneralSettings, object: nil) }
+    }
+    @objc func showUpdateSettings() {
+        showSettings()
+        DispatchQueue.main.async { NotificationCenter.default.post(name: .profileShelfShowUpdates, object: nil) }
+    }
+    private func applyVisibility() {
+        let policy = AppVisibility.activationPolicy(preferences: model.preferences, settingsOpen: settingsOpen)
+        if NSApp.activationPolicy() != policy { NSApp.setActivationPolicy(policy) }
+        // Never leave both quick-access surfaces hidden after a malformed preference.
+        let visible = AppVisibility.menuBarVisible(preferences: model.preferences)
+        if !visible { quickPopover.performClose(nil); quickPopoverDismissal.stop() }
+        let created = menuBarItem.setVisible(visible) { item in
+            item.button?.image = BrandArtwork.template(size: 16)
+            item.button?.toolTip = "Profile Shelf"
+            item.button?.target = self
+            item.button?.action = #selector(statusClick)
+            item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+        if created { updateMenuBarSummary() }
+    }
+    /// Keep an in-progress editor visible instead of hiding its sheet.
+    func prepareCompactPresentation() -> Bool {
+        if settingsWindow?.attachedSheet != nil {
+            NSApp.activate(ignoringOtherApps: true)
+            settingsWindow?.makeKeyAndOrderFront(nil)
+            return false
+        }
+        settingsWindow?.orderOut(nil)
+        settingsOpen = false
+        applyVisibility()
+        return true
+    }
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === settingsWindow else { return }
+        settingsOpen = false; applyVisibility()
+    }
+    @objc func checkProfileShelfUpdates() { selfUpdates.check() }
+    @objc func supportProfileShelf() { showDestination(.profileShelfShowSupport) }
+
+    @objc func menuSelect(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String, let profile = model.preferences.profiles.first(where: { $0.id == id }) else { return }
+        rememberUsageProfile(profile.id)
+        model.select(profile)
+    }
+    @objc func openFromShortcut(_ notification: Notification) {
+        guard let id = notification.userInfo?["profileID"] as? String, Profile.validID(id),
+              let profile = model.preferences.profiles.first(where: { $0.id == id }) else { return }
+        rememberUsageProfile(id)
+        model.select(profile)
+    }
+    @objc func menuAlongside(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String, let profile = model.preferences.profiles.first(where: { $0.id == id }) else { return }
+        rememberUsageProfile(profile.id)
+        model.select(profile, mode: .alongside)
+    }
+    @objc func quit() { NSApp.terminate(nil) }
+    @objc func toggleLoginItem() {
+        loginItem.refresh()
+        loginItem.setEnabled(!loginItem.enabled)
+        if loginItem.requiresApproval || loginItem.error != nil { showSettings() }
+    }
+
+    @objc func showSettings() {
+        quickPopover.performClose(nil)
+        quickWindow?.orderOut(nil)
+        loginItem.refresh()
+        if settingsWindow == nil {
+            let compact = previewMode && CommandLine.arguments.contains("--compact-preview")
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: compact ? 760 : 920, height: compact ? 560 : 700), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            window.title = "Profile Shelf"
+            if previewMode, let index = CommandLine.arguments.firstIndex(of: "--preview-appearance"), CommandLine.arguments.indices.contains(index + 1) {
+                window.appearance = NSAppearance(named: CommandLine.arguments[index + 1] == "light" ? .aqua : .darkAqua)
+            }
+            if previewMode { window.subtitle = Bundle.main.object(forInfoDictionaryKey: "ProfileShelfContextPreview") as? Bool == true ? "Context preview" : "New installation preview" }
+            window.contentView = NSHostingView(rootView: SettingsView(model: model, loginItem: loginItem, activity: activity, updates: appUpdates, selfUpdates: selfUpdates, insights: insights, cues: cues, chooseImage: { [weak self, weak window] profile in self?.model.chooseImage(for: profile, window: window) }, compact: { [weak self] in self?.showQuickWindow() }))
+            window.minSize = NSSize(width: 760, height: 560)
+            window.isReleasedWhenClosed = false
+            window.delegate = self
+            window.center()
+            if !previewMode {
+                window.setFrameAutosaveName("ProfileShelf.Settings")
+                window.setFrameUsingName("ProfileShelf.Settings")
+            }
+            settingsWindow = window
+        }
+        settingsOpen = true
+        applyVisibility()
+        NSApp.activate(ignoringOtherApps: true)
+        if settingsWindow?.isMiniaturized == true { settingsWindow?.deminiaturize(nil) }
+        settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    func registerHotKeys() {
+        for key in hotKeys { UnregisterEventHotKey(key) }
+        hotKeys.removeAll()
+        if eventHandler == nil {
+            var event = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            InstallEventHandler(GetApplicationEventTarget(), { _, event, pointer in
+                guard let event, let pointer else { return OSStatus(eventNotHandledErr) }
+                var id = EventHotKeyID()
+                GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
+                let delegate = Unmanaged<AppDelegate>.fromOpaque(pointer).takeUnretainedValue()
+                MainActor.assumeIsolated {
+                    let index = Int(id.id) - 1
+                    if delegate.model.displayedProfiles.indices.contains(index) { delegate.model.select(delegate.model.displayedProfiles[index]) }
+                }
+                return noErr
+            }, 1, &event, Unmanaged.passUnretained(self).toOpaque(), &eventHandler)
+        }
+        let codes = [kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5, kVK_ANSI_6, kVK_ANSI_7, kVK_ANSI_8, kVK_ANSI_9]
+        for index in 0..<min(model.displayedProfiles.count, codes.count) {
+            var reference: EventHotKeyRef?
+            let status = RegisterEventHotKey(UInt32(codes[index]), UInt32(cmdKey | optionKey), EventHotKeyID(signature: 0x41444F43, id: UInt32(index + 1)), GetApplicationEventTarget(), 0, &reference)
+            if status == noErr, let reference { hotKeys.append(reference) }
+            else { model.message = "Shortcut ⌥⌘\(index + 1) is already in use. You can still use the profile buttons." }
+        }
+    }
+}
+
+import Combine
+
+@main
+struct ProfileShelf {
+    /// Started from a terminal inside a Claude Code session, the app would inherit that session's configuration
+    /// folder and pass it to every Claude it opens, so the main sign-in would read another account's sessions.
+    /// Profile Shelf never relies on this variable itself; each account it launches sets its own when needed.
+    static func dropInheritedClaudeConfiguration() {
+        unsetenv("CLAUDE_CONFIG_DIR")
+    }
+
+    static func main() {
+        dropInheritedClaudeConfiguration()
+        let application = NSApplication.shared
+        if CommandLine.arguments.dropFirst().first == "--prepare-native-dock" {
+            guard CommandLine.arguments.count == 4, let pid = Int32(CommandLine.arguments[3]), pid == getppid() else { exit(1) }
+            let model = DockModel(), id = CommandLine.arguments[2]
+            guard let profile = model.preferences.profiles.first(where: { $0.id == id }),
+                  let expected = model.nativeDockURL(for: profile),
+                  let executable = try? NativeDockApp.info(expected)["CFBundleExecutable"] as? String,
+                  RunningProfileApplication.executablePath(pid: pid) == expected.appendingPathComponent("Contents/MacOS/\(executable)").resolvingSymlinksInPath().path,
+                  NSRunningApplication(processIdentifier: pid)?.bundleURL?.resolvingSymlinksInPath().path == expected.path else { exit(1) }
+            var done = false, succeeded = false
+            Task { @MainActor in
+                do { try await model.setNativeDockIcon(for: profile, enabled: true, launchingPID: pid); succeeded = true }
+                catch { FileHandle.standardError.write(Data(error.localizedDescription.utf8)) }
+                done = true
+            }
+            while !done { RunLoop.current.run(until: Date().addingTimeInterval(0.1)) }
+            exit(succeeded ? 0 : 1)
+        }
+        if CommandLine.arguments.contains("--validate-launcher") {
+            guard let id = Bundle.main.object(forInfoDictionaryKey: "ProfileShelfProfileID") as? String, Profile.validID(id) else { exit(1) }
+            print(id); return
+        }
+        if let id = Bundle.main.object(forInfoDictionaryKey: "ProfileShelfProfileID") as? String {
+            guard Profile.validID(id) else { return }
+            // Route new shortcuts through the one running manager, so per-app
+            // switch locks also protect rapid clicks on different Dock shortcuts.
+            let managers = NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.haiderali136a.profileshelf")
+            if let manager = managers.first(where: { $0.bundleURL.flatMap { Bundle(url: $0)?.object(forInfoDictionaryKey: "ProfileShelfBuild") as? Bool } == true }) {
+                _ = manager
+                DistributedNotificationCenter.default().postNotificationName(Notification.Name("ProfileShelf.OpenProfile"), object: nil,
+                    userInfo: ["profileID": id], deliverImmediately: true)
+                return
+            }
+            if !managers.isEmpty {
+                let alert = NSAlert(); alert.messageText = "Quit the other profile manager before using this shortcut."
+                alert.informativeText = "Open Profile Shelf to switch accounts."; alert.runModal(); return
+            }
+            if let managerPath = Bundle.main.object(forInfoDictionaryKey: "ProfileShelfManagerPath") as? String {
+                let url = URL(fileURLWithPath: managerPath)
+                if Bundle(url: url)?.object(forInfoDictionaryKey: "ProfileShelfBuild") as? Bool == true {
+                    var finished = false
+                    let configuration = NSWorkspace.OpenConfiguration(); configuration.arguments = ["--select-profile", id]
+                    NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, error in
+                        if let error { FileHandle.standardError.write(Data(error.localizedDescription.utf8)) }
+                        DispatchQueue.main.async { finished = true }
+                    }
+                    let deadline = Date().addingTimeInterval(15)
+                    while !finished, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.05)) }
+                    return
+                }
+            }
+            // Legacy shortcuts without a manager path keep their original route.
+            let model = DockModel()
+            guard Profile.validID(id), let profile = model.preferences.profiles.first(where: { $0.id == id }) else {
+                let alert = NSAlert(); alert.messageText = "This profile is no longer in Profile Shelf."; alert.runModal(); return
+            }
+            model.select(profile)
+            let deadline = Date().addingTimeInterval(105)
+            while (model.opening.contains(id) || model.switchingTargets[profile.kind] != nil), Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.1)) }
+            if let message = model.message { let alert = NSAlert(); alert.messageText = message; alert.runModal() }
+            return
+        }
+        if CommandLine.arguments.contains("--measure-animations") || CommandLine.arguments.contains("--stop-measuring-animations") {
+            let value = CommandLine.arguments.contains("--measure-animations") ? "start" : "stop"
+            DistributedNotificationCenter.default().postNotificationName(Notification.Name("io.github.haiderali136a.profileshelf.measure"), object: value, userInfo: nil, deliverImmediately: true)
+            return
+        }
+        if CommandLine.arguments.contains("--enable-login-item") || CommandLine.arguments.contains("--login-item-status") {
+            let loginItem = LoginItemModel()
+            if CommandLine.arguments.contains("--enable-login-item") { loginItem.setEnabled(true) }
+            let output: [String: Any] = ["status": loginItem.statusName, "error": loginItem.error as Any? ?? NSNull(), "app": Bundle.main.bundleURL.path]
+            if let data = try? JSONSerialization.data(withJSONObject: output, options: [.prettyPrinted, .sortedKeys]), let content = String(data: data, encoding: .utf8) { print(content) }
+            if CommandLine.arguments.contains("--enable-login-item") && !loginItem.enabled { exit(1) }
+            return
+        }
+        if CommandLine.arguments.contains("--live-diagnostics") {
+            let requestID = UUID().uuidString
+            DistributedNotificationCenter.default().postNotificationName(Notification.Name("io.github.haiderali136a.profileshelf.diagnostics"), object: requestID, userInfo: nil, deliverImmediately: true)
+            let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Profile Shelf/live-diagnostics.json")
+            let deadline = Date().addingTimeInterval(2)
+            repeat {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                if let data = try? Data(contentsOf: file), let output = try? JSONSerialization.jsonObject(with: data) as? [String: Any], output["requestID"] as? String == requestID, let content = String(data: data, encoding: .utf8) { print(content); return }
+            } while Date() < deadline
+            FileHandle.standardError.write(Data("No fresh response from the running Profile Shelf.\n".utf8))
+            exit(1)
+        }
+        if CommandLine.arguments.contains("--diagnostics") {
+            let model = DockModel()
+            let rows: [[String: Any]] = model.preferences.profiles.map { profile in
+                ["id": profile.id, "name": profile.name, "pids": (model.running[profile.id] ?? []).map(\.processIdentifier), "active": model.activeProfile == profile.id]
+            }
+            let screens: [[String: Any]] = NSScreen.screens.map { screen in
+                let layout = IslandController.layout(screen: screen, model: model)
+                return ["name": screen.localizedName, "screen": NSStringFromRect(screen.frame), "notchHeight": screen.safeAreaInsets.top, "collapsed": NSStringFromRect(layout.collapsed), "expanded": NSStringFromRect(layout.expanded)]
+            }
+            let output: [String: Any] = ["profiles": rows, "unreadableProcesses": model.unreadableProcesses, "screens": screens]
+            if let data = try? JSONSerialization.data(withJSONObject: output, options: [.prettyPrinted, .sortedKeys]), let string = String(data: data, encoding: .utf8) { print(string) }
+            return
+        }
+        let delegate = AppDelegate()
+        application.delegate = delegate
+        withExtendedLifetime(delegate) { application.run() }
+    }
+}
+

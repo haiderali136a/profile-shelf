@@ -1,0 +1,57 @@
+# Privacy & security
+
+Profile Shelf has no account system, advertising, or external analytics. Usage insights stay on your Mac.
+
+Context sharing is a separate, opt-in feature. Its local preview stays on your Mac. When a connected task retrieves passages, those passages become context in the task's current account; that account's provider and workspace policies apply. Enabling a connection alone does not grant access to other profiles.
+
+## What it reads
+
+- Profile preferences, your selected pictures, running app arguments, and local profile directories.
+- The signed-in profile's existing `auth.json` to request usage and reset-expiry information directly from `chatgpt.com` over HTTPS. Tokens are not written to Profile Shelf's preferences or sent to a Profile Shelf server.
+- Local Work/Codex task metadata, read markers, and the desktop observer socket to display activity. Stream payloads may contain task content transiently; Profile Shelf retains only the status/count metadata it needs, not transcripts.
+- When Usage insights is opened, local `sessions` and `archived_sessions` JSONL files for the configured profiles. These files can contain conversation text; the scanner discards it and keeps only token counters, model names, timestamps, and session identifiers. Insights are not uploaded. At launch, a private local cache preloads the last loaded statistics and resumes reading new records after a restart.
+- On an explicit Context search or read, the allowed source profiles' local `state_5.sqlite`, `thread_history_1.sqlite`, or referenced JSONL conversation files. The context helper selects visible user/assistant text, filters known injected records, excludes reasoning/tool records and subagent histories, and redacts recognizable token patterns. This is not a guarantee that arbitrary secrets pasted into a conversation can all be identified. It does not read `auth.json`, merge accounts, resume tasks, or contact a model provider itself.
+
+## What it writes
+
+- Usage rate-limit deadlines in `~/Library/Application Support/Profile Shelf/RateLimits/cooldowns.json`. Only hashed provider/account/endpoint keys and retry timestamps are stored, in a private directory (0700) and file (0600). No tokens, account names, raw account IDs, or conversation content are saved there.
+
+- Rebuildable insight counters, profile/model/session identifiers, read offsets, and hashed file fingerprints in `~/Library/Caches/io.github.haiderali136a.profileshelf/insights-v1.json`. No transcript text, credentials, display names, or raw session-file paths are stored there. The directory is private to the macOS user (0700), and the file uses 0600 permissions. Report samples are trimmed to the current 30-day window when refreshed; cumulative checkpoints are retained to avoid recounting old usage. macOS may discard this cache; deleting it only makes the next scan start from source history.
+- Preferences and resized pictures in `~/Library/Application Support/Profile Shelf`.
+- New local profiles in `~/.codex-profile-…`; no existing credentials or conversations are copied into a new profile.
+- Finder launchers in `~/Applications/Profile Shelf Launchers` and optional signed ChatGPT copies in `~/Applications/Profile Shelf Apps`.
+- When experimental native Dock icons are explicitly enabled, locally re-signed ChatGPT copies in `~/Applications/Profile Shelf Dock Apps`. The original signed app and profile data directories are retained. Copy preparation, repairs and updates may also create temporary or recovery app bundles.
+- Downloaded updates in a temporary directory, and a recovery copy beside each replaced app.
+- Directional Context permissions and the bundled helper in `~/Library/Application Support/Profile Shelf/Context` (private directory 0700; permissions file 0600). No persistent transcript index is created. Source databases are opened read-only. For closed WAL-mode databases without sidecars, the helper makes a consistency-checked copy in a private temporary directory, reads that copy, then deletes it when the read finishes. A crash may leave a temporary copy for macOS cleanup; it can contain the original database's text. Live WAL records are never silently ignored.
+- When you select Context **Connect**, the official `codex mcp add` command registers a profile-bound local helper in that profile's Codex configuration. Profile Shelf also installs its marked skill in `skills/profile-shelf-context/SKILL.md`, plus a small skill and UI metadata for each enabled source in that receiving profile's skills directory. These source skills let the desktop chat offer profile mentions in its existing skill picker. They contain profile labels and stable IDs, never conversation text. Other server entries and custom skills are preserved. **Disconnect & turn off sharing** revokes that caller's grants first, removes the managed connection and unmodified skills, and keeps source conversations intact.
+
+Imported profiles are kept in their existing locations. Removing a profile keeps its data unless you explicitly choose the Trash option. Profile Shelf never deletes the stock `.codex` home through that option.
+
+## Network access
+
+Codex usage requests go directly to OpenAI and reject redirects. Claude usage requests read only the current macOS user’s `Claude Code-credentials` Keychain item and send its access token directly to `api.anthropic.com` over HTTPS, rejecting redirects. Tokens are never logged or copied to preferences. When you choose Reconnect, Profile Shelf starts the installed provider’s official subscription sign-in. After you finish browser authentication, the provider updates its own credentials. Codex reconnection uses only the selected profile’s home; Claude reconnection renews the shared Claude Code sign-in. Account and organization identifiers are hashed for in-memory identity checks. Optional saved-reset tracking opens `claude.ai` in Profile Shelf’s own WebKit session after you select Connect. Its cookies stay in the app’s WebKit data store, are not imported from other apps, and are removed on Disconnect. Read-only requests verify organization access before reading reset grants. No reset is consumed. Update checks and selected downloads use OpenAI's `persistent.oaistatic.com` update feed. Downloads must pass its Ed25519 signature and the installed app must have OpenAI's Apple developer signature. No update requires signing into a third-party service.
+
+Profile Shelf has no self-update feed and does not check anywhere for manager updates. Provider app update checks and explicitly selected provider downloads remain available. Release downloads and local builds are ad hoc signed, not Developer ID signed or notarized.
+
+Bundled documentation opens locally. If a future build configures its own repository URL, repository links open only when clicked. Activity sounds are local audio files with no network requests.
+
+## Boundaries
+
+Separate profiles are a convenience within one macOS account, not isolation of Keychain, filesystem, developer tools, or server-side access. Verify the signed-in account in each ChatGPT window. Use separate macOS users when you need stronger separation.
+
+Experimental native Dock copies replace OpenAI's signature, remove vendor-only permissions and disable library validation. Some integrations and sign-in or permission prompts can differ from the original signed app. The option is off by default, and generated copies are never distributed with Profile Shelf. Disabling first verifies the original app's signature, then removes the copy without moving or deleting profile data. See [native Dock tradeoffs](docs/NATIVE-DOCK.md).
+
+The reset and activity interfaces are not a compatibility guarantee from OpenAI. Unknown and unavailable readings are shown explicitly. Profile Shelf does not redeem resets or alter subscription plans.
+
+Usage insights cover local profile history, not an account-wide billing record. Changing a profile's sign-in does not reassign older records. API-equivalent amounts compare recorded text tokens against a dated table of Standard USD API rates; they are not invoices or subscription savings. Unpriced and incomplete records are identified. See [the calculation guide](docs/INSIGHTS.md).
+
+Diagnostics are opt-in local files and can contain profile identifiers and app paths. Review them before sharing; never attach credentials, raw task databases, or private screenshots to a public issue.
+# Claude and Terminal integration
+
+The development version can control Apple Terminal through macOS Automation permission. It reads window/tab identifiers and titles, plus process executable names, TTYs and foreground state to detect active coding-agent terminals. For a foreground `node`, `python`, `bun`, `deno` or `ruby` process it also reads that process's argv to see which installed script it runs, and for a shared command name such as `pi` or `agent` it reads the executable path. Other commands, such as `claude` with a prompt, are matched by name without reading their arguments. Nothing is stored or sent anywhere. To find sessions in other terminal apps and tmux it also reads each process's parent and its name as `ps` shows it (the executable path, or for a login shell its first argument such as `-zsh`), never the rest of its arguments. It never reads a process environment, terminal contents or scrollback.
+
+To find coding tools, Profile Shelf checks whether files and folders exist in the usual install locations, where command symlinks point, and each app's `Info.plist`. For a separate Grok Bot account it reads one value, `signedIn`, from the `desktop-status.json` file the app writes in that account's own folder, to show **Sign-in needed**. It never opens sign-in files, tokens or the Keychain. A user-selected project folder is retained for reopening a tab.
+
+The optional Claude Code bridge receives local hook and status-line input. It persists only session metadata, activity and usage counters. Prompts, tool inputs, responses and credentials from hook input are discarded. Existing Claude hooks are preserved, an existing status-line command retains its input/output, and private backups are kept before changing configuration.
+
+Claude conversation search reads visible user/assistant text from local `~/.claude/projects` transcripts under the existing directional context permissions. Thinking blocks, tool payloads, metadata records and subagent directories are excluded. Claude Chat, Cowork and cloud-only histories are not covered. Usage Insights retains counters, not transcript text. See [Claude and Terminal](docs/CLAUDE-TERMINAL.md) for the exact paths and scope.

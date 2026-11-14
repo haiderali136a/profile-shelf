@@ -1,0 +1,18 @@
+{
+  "name": "profile-shelf-context",
+  "version": "0.1.0",
+  "description": "Use earlier local Work/Codex conversations from explicitly enabled Profile Shelf profiles.",
+  "author": {
+    "name": "Haider Ali"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Profile Shelf Context",
+    "shortDescription": "Bring context across your profiles.",
+    "longDescription": "Search earlier local Work/Codex conversations with source references. Connect the local helper and choose one-way sharing permissions in Profile Shelf → Context Access before using this workflow.",
+    "developerName": "Haider Ali",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Check earlier conversations about this topic in the Profile Shelf profiles I specify."
+  }
+}

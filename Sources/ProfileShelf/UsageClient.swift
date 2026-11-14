@@ -1,0 +1,177 @@
+import Foundation
+import CryptoKit
+import DockCore
+
+enum UsageLoadError: Error, Equatable {
+    case notSignedIn, authorizationRequired, claudeSignInRequired, claudeTokenStale, claudeConnectionNeeded, claudeOtherAccount, accountChanged, wrongAccount, invalidResponse, network, http(Int), rateLimited(Date)
+    var needsSignIn: Bool {
+        switch self {
+        case .notSignedIn, .authorizationRequired, .claudeSignInRequired: return true
+        default: return false
+        }
+    }
+    /// Reconnect stays available without the orange sign-in nudge.
+    var offersReconnect: Bool { needsSignIn || self == .claudeTokenStale || self == .claudeConnectionNeeded || self == .claudeOtherAccount }
+    /// The access token expired but Claude Code still holds a refresh token, so the last verified reading remains valid.
+    var preservesReading: Bool { self == .claudeTokenStale }
+    /// Short tile label; only real sign-in failures read as a warning.
+    var statusLabel: String {
+        switch self {
+        case _ where needsSignIn: return "Sign-in needed"
+        case .claudeTokenStale: return "Waiting for Claude Code to refresh"
+        case .claudeConnectionNeeded: return "Connect usage"
+        case .claudeOtherAccount: return "Claude Code uses another account"
+        case .rateLimited(let until): return "Usage paused until " + until.formatted(date: .omitted, time: .shortened)
+        default: return "Unavailable"
+        }
+    }
+    var message: String {
+        switch self {
+        case .notSignedIn, .authorizationRequired: return "Open this profile and check that you are signed in."
+        case .claudeSignInRequired: return "Open Claude Code and sign in to refresh account usage."
+        case .claudeConnectionNeeded: return "Claude Code has not signed in for this account yet. Connect usage to sign in once."
+        case .claudeOtherAccount: return "Claude Code is signed in to a different account than this Claude app, so its usage is not shown here. Reconnect and sign in with this app's account."
+        case .claudeTokenStale: return "Waiting for Claude Code to renew its sign-in. It does this the next time it runs. Refresh to check again, or Reconnect to sign in now."
+        case .rateLimited(let until): return "The provider requested a pause. Usage can retry after " + until.formatted(date: .abbreviated, time: .shortened) + ". Automatic refresh resumes on its normal schedule; reconnecting is not needed."
+        case .accountChanged: return "Account changed. Refresh usage again."
+        case .wrongAccount: return "The response belongs to a different account."
+        case .invalidResponse: return "Usage data could not be read."
+        case .network: return "No connection. Try again."
+        case .http: return "Usage data is temporarily unavailable."
+        }
+    }
+    var clearsSnapshot: Bool {
+        switch self {
+        case .notSignedIn, .authorizationRequired, .claudeSignInRequired, .claudeConnectionNeeded, .claudeOtherAccount, .accountChanged, .wrongAccount: return true
+        default: return false
+        }
+    }
+}
+
+protocol UsageFetching: Sendable {
+    func invalidate() async
+    func identity(for profile: Profile) async throws -> String
+    func fetch(_ profile: Profile, expectedIdentity: String) async throws -> UsageSnapshot
+}
+
+extension UsageFetching { func invalidate() async {} }
+
+struct UsageCredentials: Sendable {
+    let accessToken: String
+    let accountID: String
+    let identity: String
+    var cooldownIdentity: String? = nil
+
+    static func read(profile: Profile, home: URL) throws -> UsageCredentials {
+        guard Profile.validID(profile.id) else { throw UsageLoadError.notSignedIn }
+        let file = profile.home(in: home).appendingPathComponent("auth.json")
+        guard let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 1_048_576,
+              let data = try? Data(contentsOf: file) else { throw UsageLoadError.notSignedIn }
+        return try parse(data: data, source: file)
+    }
+
+    static func parse(data: Data, source: URL) throws -> UsageCredentials {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              root["auth_mode"] as? String == "chatgpt",
+              let tokens = root["tokens"] as? [String: Any],
+              let token = tokens["access_token"] as? String, !token.isEmpty,
+              let account = tokens["account_id"] as? String, !account.isEmpty,
+              token.rangeOfCharacter(from: .controlCharacters) == nil,
+              account.rangeOfCharacter(from: .controlCharacters) == nil else { throw UsageLoadError.notSignedIn }
+        if let expiry = jwtClaims(token)?["exp"] as? Double, !expiry.isFinite || expiry <= Date().timeIntervalSince1970 {
+            throw UsageLoadError.authorizationRequired
+        }
+        let claims = [tokens["id_token"] as? String, token].compactMap { $0 }.compactMap(jwtClaims)
+        guard let subject = claims.compactMap({ $0["sub"] as? String }).first(where: { !$0.isEmpty }) else { throw UsageLoadError.notSignedIn }
+        let key = source.standardizedFileURL.path + "\n" + account + "\n" + subject
+        let digest = SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+        return UsageCredentials(accessToken: token, accountID: account, identity: digest, cooldownIdentity: SHA256.hash(data: Data((account + "\n" + subject).utf8)).map { String(format: "%02x", $0) }.joined())
+    }
+
+    private static func jwtClaims(_ token: String) -> [String: Any]? {
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3 else { return nil }
+        var payload = String(parts[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        payload += String(repeating: "=", count: (4 - payload.count % 4) % 4)
+        guard let data = Data(base64Encoded: payload) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+}
+
+final class NoUsageRedirects: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        // A credential-bearing request never follows a redirect to any other location.
+        completionHandler(nil)
+    }
+}
+
+actor UsageClient: UsageFetching {
+    private let home: URL
+    private let session: URLSession
+    private let cooldowns: UsageCooldowns
+    private let clock: @Sendable () -> Date
+    init(home: URL = FileManager.default.homeDirectoryForCurrentUser, session: URLSession? = nil, cooldowns: UsageCooldowns? = nil, clock: @escaping @Sendable () -> Date = { Date() }) {
+        self.cooldowns = cooldowns ?? (session == nil ? .shared : UsageCooldowns())
+        self.clock = clock
+        self.home = home
+        if let session { self.session = session }
+        else {
+            let config = URLSessionConfiguration.ephemeral
+            config.httpShouldSetCookies = false
+            config.httpCookieStorage = nil
+            config.urlCredentialStorage = nil
+            config.urlCache = nil
+            config.httpMaximumConnectionsPerHost = 3
+            config.timeoutIntervalForRequest = 10
+            config.timeoutIntervalForResource = 12
+            self.session = URLSession(configuration: config, delegate: NoUsageRedirects(), delegateQueue: nil)
+        }
+    }
+
+    func identity(for profile: Profile) async throws -> String { try UsageCredentials.read(profile: profile, home: home).identity }
+
+    func fetch(_ profile: Profile, expectedIdentity: String) async throws -> UsageSnapshot {
+        let credential = try UsageCredentials.read(profile: profile, home: home)
+        guard credential.identity == expectedIdentity else { throw UsageLoadError.accountChanged }
+        try cooldowns.check("codex:" + (credential.cooldownIdentity ?? credential.identity) + ":usage", now: clock())
+        async let usage = request(path: "usage", credential: credential, timeout: 10)
+        async let inventory = optionalInventory(credential)
+        let data = try await usage
+        let resetData = await inventory
+        try Task.checkCancellation()
+        // Signing into a different account while a request is in flight must invalidate that response.
+        let current = try UsageCredentials.read(profile: profile, home: home)
+        guard current.identity == credential.identity else { throw UsageLoadError.accountChanged }
+        do {
+            return try UsageParser.parse(usage: data, resets: resetData, expectedAccount: credential.accountID, identity: credential.identity, fetchedAt: Date())
+        } catch UsageParseError.wrongAccount { throw UsageLoadError.wrongAccount }
+        catch { throw UsageLoadError.invalidResponse }
+    }
+
+    private func optionalInventory(_ credential: UsageCredentials) async -> Data? {
+        try? await request(path: "rate-limit-reset-credits", credential: credential, timeout: 4)
+    }
+
+    private func request(path: String, credential: UsageCredentials, timeout: TimeInterval) async throws -> Data {
+        let scope = "codex:" + (credential.cooldownIdentity ?? credential.identity) + ":" + path
+        try cooldowns.check(scope, now: clock())
+        let url = URL(string: "https://chatgpt.com/backend-api/wham/\(path)")!
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(credential.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(credential.accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("ProfileShelf/1.3", forHTTPHeaderField: "User-Agent")
+        let data: Data
+        let response: URLResponse
+        do { (data, response) = try await session.data(for: request) }
+        catch is CancellationError { throw CancellationError() }
+        catch { throw UsageLoadError.network }
+        guard let http = response as? HTTPURLResponse else { throw UsageLoadError.invalidResponse }
+        if http.statusCode == 401 || http.statusCode == 403 { throw UsageLoadError.authorizationRequired }
+        if http.statusCode == 429 { throw UsageLoadError.rateLimited(cooldowns.record(scope, response: http, now: clock())) }
+        guard http.statusCode == 200 else { throw UsageLoadError.http(http.statusCode) }
+        guard data.count <= 1_048_576 else { throw UsageLoadError.invalidResponse }
+        return data
+    }
+}
